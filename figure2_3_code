@@ -1,0 +1,308 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+np.random.seed(42)
+from sklearn.feature_selection import mutual_info_regression
+from scipy.interpolate import PchipInterpolator
+from tqdm import tqdm
+
+# ------------------------------------------------------------
+#  Parameters (matching the paper's stated simulation setup)
+# ------------------------------------------------------------
+p = 1.0
+beta = 0.3 + 0.4j
+num_samples = 1000                 # channel realizations per SNR point
+snr_db_range = np.arange(0, 31, 5)  # 0,5,...,30 dB
+
+# OFDM parameters
+N = 256
+Ncp = 64
+L_max = 10          # l_{c_1}
+Nt = N + Ncp
+
+# IRS / SBF parameters (matching Algorithm 1 exactly)
+M = 128
+SBF_iterations = 30
+delta = np.pi / 20   # perturbation range, eps_m(k) ~ U[-delta, delta]
+
+# ------------------------------------------------------------
+#  Output directory (created automatically if it doesn't exist)
+# ------------------------------------------------------------
+OUTPUT_DIR = "./outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ------------------------------------------------------------
+#  Helper functions
+# ------------------------------------------------------------
+def generate_channel_taps(L):
+    """Exponential PDP Rayleigh fading taps with 3 dB decay per tap."""
+    decay_per_tap_dB = 3.0
+    r = 10 ** (-decay_per_tap_dB / 10.0)          # linear power ratio per tap
+    power = r ** np.arange(L)
+    power = power / np.sum(power)
+    taps = np.sqrt(power / 2) * (np.random.randn(L) + 1j * np.random.randn(L))
+    return taps
+
+def ofdm_symbol(N, Ncp):
+    data = (np.random.choice([1+1j, 1-1j, -1+1j, -1-1j], N) / np.sqrt(2))
+    ifft_out = np.fft.ifft(data, N) * np.sqrt(N)
+    cp = ifft_out[-Ncp:]
+    return np.concatenate([cp, ifft_out])
+
+def backscatter_waveform(Nt, bit=1):
+    if bit == 0:
+        return -np.ones(Nt, dtype=complex)
+    else:
+        w = np.ones(Nt, dtype=complex)
+        half = Nt // 2
+        w[half:] = -1
+        return w
+
+def extract_triangle_channel(y, N, Ncp, L_max):
+    start = L_max - 1
+    end = Ncp - 1
+    if start >= end:
+        start = 0
+        end = Ncp
+    J = end - start + 1
+    if J <= 0:
+        return 0.0
+    sum_abs = 0.0
+    for n in range(start, end + 1):
+        z_b = y[n] - y[n + N]
+        z_d = y[n] + y[n + N]
+        sum_abs += np.abs(z_b * z_d)
+    return sum_abs / J
+
+def quantize_to_bits(seq):
+    thresh = np.median(seq)
+    return (seq > thresh).astype(int)
+
+def bit_disagreement_ratio(bits1, bits2):
+    return np.mean(bits1 != bits2)
+
+def mutual_info_continuous(x, y):
+    mi_nats = mutual_info_regression(x.reshape(-1, 1), y, random_state=42)[0]
+    return mi_nats / np.log(2)
+
+# ------------------------------------------------------------
+#  SBF algorithm (Algorithm 1), matching Eq. (37) exactly:
+#  phi_m(k+1) = phi_best,m + eps_m(k),  eps_m(k) ~ U[-delta, delta]
+# ------------------------------------------------------------
+def sbf_algorithm(h1_I, g_I2, iterations, delta):
+    """
+    Single-Bit Feedback algorithm to maximize |sum_m h1_I[m] * exp(j*phi[m]) * g_I2[m]|.
+    Returns the best achieved (real, non-negative) gain after `iterations` steps.
+    """
+    M = len(h1_I)
+    phi_best = np.random.uniform(0, 2 * np.pi, M)  # Theta(0)
+    u_best = np.abs(np.sum(h1_I * np.exp(1j * phi_best) * g_I2))
+
+    for k in range(iterations):
+        eps = np.random.uniform(-delta, delta, M)
+        phi_new = phi_best + eps
+        u_new = np.abs(np.sum(h1_I * np.exp(1j * phi_new) * g_I2))
+        if u_new > u_best:   # b(k) = 1
+            u_best = u_new
+            phi_best = phi_new
+        # else: b(k) = 0, perturbation discarded, phi_best/u_best unchanged
+    return u_best
+
+# ------------------------------------------------------------
+#  Simulation for one SNR point, run independently for each realization
+#  (SBF is re-initialized and re-converged per channel realization)
+# ------------------------------------------------------------
+def simulate_one_snr(snr_db, num_samples, N, Ncp, L_max, M, sbf_iter, delta):
+    sigma_n = np.sqrt(10.0 ** (-snr_db / 10.0))
+    L_h = max(1, L_max // 2)
+
+    v1_noirs, v2_noirs = [], []
+    v1_sbf, v2_sbf = [], []
+
+    for _ in range(num_samples):
+        h1_dir = generate_channel_taps(L_h)
+        h2_dir = generate_channel_taps(L_h)
+        h12_dir = generate_channel_taps(L_h)
+        g1 = h1_dir[0]
+        g2 = h2_dir[0]
+        direct_inward = h12_dir[0]
+
+        # IRS channels for this realization
+        h1_I = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
+        g_I2 = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
+
+        # Run SBF fresh for this channel realization
+        sbf_gain = sbf_algorithm(h1_I, g_I2, sbf_iter, delta)
+
+        G12_noirs = direct_inward
+        G12_sbf = direct_inward + sbf_gain
+
+        s_t = ofdm_symbol(N, Ncp)
+        b = backscatter_waveform(Nt, bit=1)
+
+        def get_triangle_estimate(G12):
+            back_T1 = beta * (s_t * g2) * b * G12
+            direct_T1 = s_t * g1
+            noise1 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
+            y1 = back_T1 + direct_T1 + noise1
+            u1 = extract_triangle_channel(y1, N, Ncp, L_max)
+
+            back_T2 = beta * (s_t * g1) * b * G12
+            direct_T2 = s_t * g2
+            noise2 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
+            y2 = back_T2 + direct_T2 + noise2
+            u2 = extract_triangle_channel(y2, N, Ncp, L_max)
+            return u1, u2
+
+        u1_n, u2_n = get_triangle_estimate(G12_noirs)
+        u1_s, u2_s = get_triangle_estimate(G12_sbf)
+
+        v1_noirs.append(u1_n); v2_noirs.append(u2_n)
+        v1_sbf.append(u1_s); v2_sbf.append(u2_s)
+
+    v1_noirs, v2_noirs = np.array(v1_noirs), np.array(v2_noirs)
+    v1_sbf, v2_sbf = np.array(v1_sbf), np.array(v2_sbf)
+
+    mi_noirs = mutual_info_continuous(v1_noirs, v2_noirs)
+    mi_sbf = mutual_info_continuous(v1_sbf, v2_sbf)
+
+    bdr_noirs = bit_disagreement_ratio(quantize_to_bits(v1_noirs), quantize_to_bits(v2_noirs))
+    bdr_sbf = bit_disagreement_ratio(quantize_to_bits(v1_sbf), quantize_to_bits(v2_sbf))
+
+    return mi_noirs, mi_sbf, bdr_noirs, bdr_sbf
+
+# ------------------------------------------------------------
+#  Run simulations across the SNR sweep
+# ------------------------------------------------------------
+mi_noirs_all, mi_sbf_all = [], []
+bdr_noirs_all, bdr_sbf_all = [], []
+
+for snr_db in tqdm(snr_db_range, desc="Simulating"):
+    mi_n, mi_s, bdr_n, bdr_s = simulate_one_snr(
+        snr_db, num_samples, N, Ncp, L_max, M, SBF_iterations, delta)
+    mi_noirs_all.append(mi_n)
+    mi_sbf_all.append(mi_s)
+    bdr_noirs_all.append(bdr_n)
+    bdr_sbf_all.append(bdr_s)
+
+# ------------------------------------------------------------
+#  Smooth curves (shape-preserving, avoids overshoot/dips)
+# ------------------------------------------------------------
+snr_smooth = np.linspace(snr_db_range[0], snr_db_range[-1], 300)
+
+def smooth_curve(x, y, x_smooth):
+    pchip = PchipInterpolator(x, y)
+    return pchip(x_smooth)
+
+mi_noirs_smooth = smooth_curve(snr_db_range, mi_noirs_all, snr_smooth)
+mi_sbf_smooth = smooth_curve(snr_db_range, mi_sbf_all, snr_smooth)
+bdr_noirs_smooth = smooth_curve(snr_db_range, bdr_noirs_all, snr_smooth)
+bdr_sbf_smooth = smooth_curve(snr_db_range, bdr_sbf_all, snr_smooth)
+
+# ------------------------------------------------------------
+#  Plot styling
+# ------------------------------------------------------------
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 13,
+    "axes.linewidth": 1.1,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+})
+
+# ---- Figure: Mutual Information vs SNR ----
+fig, ax = plt.subplots(figsize=(7, 5.4), dpi=300)
+ax.plot(snr_smooth, mi_noirs_smooth, '-', linewidth=2, color='#e3342f')
+ax.plot(snr_db_range, mi_noirs_all, 'o', linestyle='None',
+        color='#e3342f', markersize=7, label='Without IRS')
+ax.plot(snr_smooth, mi_sbf_smooth, '-', linewidth=2, color='#2f9e44')
+ax.plot(snr_db_range, mi_sbf_all, 's', linestyle='None',
+        color='#2f9e44', markersize=7, label='With IRS (SBF algorithm)')
+ax.set_xlabel('SNR (dB)')
+ax.set_ylabel('Mutual Information (bits)')
+ax.grid(True, linestyle=':', linewidth=0.7, alpha=0.6)
+ax.set_axisbelow(True)
+handles, labels = ax.get_legend_handles_labels()
+handles = [plt.Line2D([0], [0], color=h.get_color(), marker=h.get_marker(),
+                       linestyle='-', linewidth=2, markersize=7) for h in handles]
+ax.legend(handles, labels, loc='upper left', frameon=True, fontsize=11)
+for spine in ax.spines.values():
+    spine.set_color('0.3')
+
+# Annotate the "Nx higher" gain factor at a few selected SNR points
+annotate_snrs = [0, 10, 20, 30]
+for snr_val in annotate_snrs:
+    idx = list(snr_db_range).index(snr_val)
+    mi_no = mi_noirs_all[idx]
+    mi_i = mi_sbf_all[idx]
+    if mi_no > 0:
+        factor = mi_i / mi_no
+        label = f'{factor:.1f}$\\times$'
+        y_mid = (mi_no + mi_i) / 2
+        ax.annotate(label, xy=(snr_val, y_mid), fontsize=9.5, ha='center',
+                    color='0.25',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                              edgecolor='0.6', alpha=0.85))
+
+plt.tight_layout()
+
+mi_path = os.path.abspath(os.path.join(OUTPUT_DIR, 'mi_vs_snr.png'))
+try:
+    plt.savefig(mi_path, dpi=600, bbox_inches='tight')
+    print(f"Saved: {mi_path}")
+except Exception as e:
+    print(f"FAILED to save MI figure: {e}")
+plt.show()
+
+# ---- Figure: BDR vs SNR ----
+fig, ax = plt.subplots(figsize=(7, 5.4), dpi=300)
+ax.semilogy(snr_smooth, bdr_noirs_smooth, '-', linewidth=2, color='#e3342f')
+ax.semilogy(snr_db_range, bdr_noirs_all, 'o', linestyle='None',
+            color='#e3342f', markersize=7, label='Without IRS')
+ax.semilogy(snr_smooth, bdr_sbf_smooth, '-', linewidth=2, color='#2f9e44')
+ax.semilogy(snr_db_range, bdr_sbf_all, 's', linestyle='None',
+            color='#2f9e44', markersize=7, label='With IRS (SBF algorithm)')
+ax.set_xlabel('SNR (dB)')
+ax.set_ylabel('Bit Disagreement Ratio')
+ax.grid(True, linestyle=':', linewidth=0.7, alpha=0.6)
+ax.set_axisbelow(True)
+handles, labels = ax.get_legend_handles_labels()
+handles = [plt.Line2D([0], [0], color=h.get_color(), marker=h.get_marker(),
+                       linestyle='-', linewidth=2, markersize=7) for h in handles]
+ax.legend(handles, labels, loc='upper right', frameon=True, fontsize=11)
+for spine in ax.spines.values():
+    spine.set_color('0.3')
+
+# Annotate the "Nx lower" reduction factor at a few selected SNR points
+annotate_snrs = [0, 10, 20, 30]
+for snr_val in annotate_snrs:
+    idx = list(snr_db_range).index(snr_val)
+    bdr_no = bdr_noirs_all[idx]
+    bdr_i = bdr_sbf_all[idx]
+    if bdr_i > 0:
+        factor = bdr_no / bdr_i
+        label = f'{factor:.1f}$\\times$'
+        y_mid = np.sqrt(bdr_no * bdr_i)  # geometric mean for log-scale placement
+        ax.annotate(label, xy=(snr_val, y_mid), fontsize=9.5, ha='center',
+                    color='0.25',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                              edgecolor='0.6', alpha=0.85))
+
+plt.tight_layout()
+
+bdr_path = os.path.abspath(os.path.join(OUTPUT_DIR, 'bdr_vs_snr.png'))
+try:
+    plt.savefig(bdr_path, dpi=600, bbox_inches='tight')
+    print(f"Saved: {bdr_path}")
+except Exception as e:
+    print(f"FAILED to save BDR figure: {e}")
+plt.show()
+
+print(f"\nAt SNR = {snr_db_range[-1]} dB:")
+print(f"  Without IRS: MI = {mi_noirs_all[-1]:.3f} bits, BDR = {bdr_noirs_all[-1]:.4f}")
+print(f"  With IRS (SBF): MI = {mi_sbf_all[-1]:.3f} bits, BDR = {bdr_sbf_all[-1]:.4f}")
+
+print('\n--- Full MI/BDR table ---')
+for i, snr in enumerate(snr_db_range):
+    print(f'SNR={snr:2d} dB | No-IRS MI={mi_noirs_all[i]:.3f}, SBF MI={mi_sbf_all[i]:.3f} | No-IRS BDR={bdr_noirs_all[i]:.4f}, SBF BDR={bdr_sbf_all[i]:.4f}')
