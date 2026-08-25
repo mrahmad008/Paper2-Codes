@@ -1,0 +1,228 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.feature_selection import mutual_info_regression
+from scipy.interpolate import make_interp_spline
+from tqdm import tqdm
+
+# ------------------------------------------------------------
+#  Parameters
+# ------------------------------------------------------------
+fs = 1e6
+p = 1.0
+alpha = 0.3 + 0.4j
+num_samples = 500            # number of channel realizations per SNR (reduced for speed)
+snr_db_range = np.arange(0, 31, 5)   # 0,5,...,30 dB
+
+# OFDM parameters
+N = 256
+Ncp = 64
+L_max = 10
+Nt = N + Ncp
+
+# IRS parameters
+M = 128                       # number of IRS elements (smaller for faster SBF)
+SBF_iterations = 30         # number of iterations for SBF algorithm
+perturb_std = 0.5            # std of random phase perturbation (radians)
+
+# ------------------------------------------------------------
+#  Helper functions
+# ------------------------------------------------------------
+def generate_channel_taps(L):
+    power = np.exp(-np.arange(L) * 0.3)
+    power = power / np.sum(power)
+    taps = np.sqrt(power/2) * (np.random.randn(L) + 1j*np.random.randn(L))
+    return taps
+
+def ofdm_symbol(N, Ncp):
+    data = (np.random.choice([1+1j, 1-1j, -1+1j, -1-1j], N) / np.sqrt(2))
+    ifft_out = np.fft.ifft(data, N) * np.sqrt(N)
+    cp = ifft_out[-Ncp:]
+    return np.concatenate([cp, ifft_out])
+
+def backscatter_waveform(Nt, bit=1):
+    if bit == 0:
+        return -np.ones(Nt, dtype=complex)
+    else:
+        w = np.ones(Nt, dtype=complex)
+        half = Nt // 2
+        w[half:] = -1
+        return w
+
+def extract_triangle_channel(y, N, Ncp, L_max):
+    start = L_max - 1
+    end = Ncp - 1
+    if start >= end:
+        start = 0
+        end = Ncp
+    J = end - start + 1
+    if J <= 0:
+        return 0.0
+    sum_abs = 0.0
+    for n in range(start, end+1):
+        z_b = y[n] - y[n + N]
+        z_d = y[n] + y[n + N]
+        sum_abs += np.abs(z_b * z_d)
+    return sum_abs / J
+
+def mutual_info_continuous(x, y):
+    mi_nats = mutual_info_regression(x.reshape(-1,1), y, random_state=42)[0]
+    return mi_nats / np.log(2)
+
+# ------------------------------------------------------------
+#  SBF algorithm for IRS phase alignment
+# ------------------------------------------------------------
+def sbf_algorithm(h1_I, g_I2, iterations, perturb_std):
+    """
+    Single-bit feedback algorithm to maximize |sum(h1_I[m] * exp(1j*theta[m]) * g_I2[m])|
+    Returns the maximum achieved gain (real positive).
+    """
+    M = len(h1_I)
+    # Random initial phases
+    theta = np.random.uniform(-np.pi, np.pi, M)
+    best_theta = theta.copy()
+    best_gain = np.abs(np.sum(h1_I * np.exp(1j*theta) * g_I2))
+
+    for _ in range(iterations):
+        # Generate random perturbations
+        epsilon = np.random.normal(0, perturb_std, M)
+        new_theta = best_theta + epsilon
+        # Evaluate gain
+        gain = np.abs(np.sum(h1_I * np.exp(1j*new_theta) * g_I2))
+        # 1-bit feedback: if improved, keep; else discard
+        if gain > best_gain:
+            best_gain = gain
+            best_theta = new_theta
+    return best_gain
+
+# ------------------------------------------------------------
+#  Simulation for one SNR point (three cases)
+# ------------------------------------------------------------
+def simulate_one_snr(snr_db, num_samples, N, Ncp, L_max, M, sbf_iter, perturb_std):
+    sigma_n = np.sqrt(10.0 ** (-snr_db / 10.0))
+
+    mi_noirs_list = []
+    mi_perfect_list = []
+    mi_sbf_list = []
+
+    for _ in range(num_samples):
+        # ---- Common channels ----
+        L_h1 = max(1, L_max // 2)
+        L_h2 = max(1, L_max // 2)
+        L_h12 = max(1, L_max // 2)
+        h1_dir = generate_channel_taps(L_h1)
+        h2_dir = generate_channel_taps(L_h2)
+        h12_dir = generate_channel_taps(L_h12)
+
+        g1 = h1_dir[0] if len(h1_dir) > 0 else 0.0
+        g2 = h2_dir[0] if len(h2_dir) > 0 else 0.0
+        direct_inward = h12_dir[0] if len(h12_dir) > 0 else 0.0
+
+        # IRS channels
+        h1_I = (np.random.randn(M) + 1j*np.random.randn(M)) / np.sqrt(2)
+        g_I2 = (np.random.randn(M) + 1j*np.random.randn(M)) / np.sqrt(2)
+
+        # Ideal maximum gain
+        ideal_irs_gain = np.sum(np.abs(h1_I) * np.abs(g_I2))
+
+        # SBF achieved gain
+        sbf_gain = sbf_algorithm(h1_I, g_I2, sbf_iter, perturb_std)
+
+        # ---- Case 1: Without IRS ----
+        G12_noirs = direct_inward
+        # ---- Case 2: Perfect IRS ----
+        G12_perfect = direct_inward + ideal_irs_gain
+        # ---- Case 3: SBF IRS ----
+        G12_sbf = direct_inward + sbf_gain
+
+        s_t = ofdm_symbol(N, Ncp)
+        b = backscatter_waveform(Nt, bit=1)
+
+        # Helper to compute triangle channel estimate for a given G12
+        def get_triangle_estimate(G12, g1, g2, s_t, b, sigma_n):
+            # T2 backscatters, T1 listens
+            back_T1 = alpha * (s_t * g2) * b * G12
+            direct_T1 = s_t * g1
+            noise1 = sigma_n * (np.random.randn(Nt) + 1j*np.random.randn(Nt)) / np.sqrt(2)
+            y1 = back_T1 + direct_T1 + noise1
+            u1 = extract_triangle_channel(y1, N, Ncp, L_max)
+            # T1 backscatters, T2 listens
+            back_T2 = alpha * (s_t * g1) * b * G12
+            direct_T2 = s_t * g2
+            noise2 = sigma_n * (np.random.randn(Nt) + 1j*np.random.randn(Nt)) / np.sqrt(2)
+            y2 = back_T2 + direct_T2 + noise2
+            u2 = extract_triangle_channel(y2, N, Ncp, L_max)
+            return u1, u2
+
+        # Collect for each case
+        u1_n, u2_n = get_triangle_estimate(G12_noirs, g1, g2, s_t, b, sigma_n)
+        u1_p, u2_p = get_triangle_estimate(G12_perfect, g1, g2, s_t, b, sigma_n)
+        u1_s, u2_s = get_triangle_estimate(G12_sbf, g1, g2, s_t, b, sigma_n)
+
+        mi_noirs_list.append((u1_n, u2_n))
+        mi_perfect_list.append((u1_p, u2_p))
+        mi_sbf_list.append((u1_s, u2_s))
+
+    # Convert to arrays and compute MI
+    def compute_mi(pairs):
+        arr1 = np.array([p[0] for p in pairs])
+        arr2 = np.array([p[1] for p in pairs])
+        return mutual_info_continuous(arr1, arr2)
+
+    mi_noirs = compute_mi(mi_noirs_list)
+    mi_perfect = compute_mi(mi_perfect_list)
+    mi_sbf = compute_mi(mi_sbf_list)
+
+    return mi_noirs, mi_perfect, mi_sbf
+
+# ------------------------------------------------------------
+#  Run simulations over SNR range
+# ------------------------------------------------------------
+mi_noirs_all = []
+mi_perfect_all = []
+mi_sbf_all = []
+
+for snr_db in tqdm(snr_db_range, desc="Simulating"):
+    mi_n, mi_p, mi_s = simulate_one_snr(snr_db, num_samples, N, Ncp, L_max, M, SBF_iterations, perturb_std)
+    mi_noirs_all.append(mi_n)
+    mi_perfect_all.append(mi_p)
+    mi_sbf_all.append(mi_s)
+
+# ------------------------------------------------------------
+#  Smooth curves
+# ------------------------------------------------------------
+snr_smooth = np.linspace(snr_db_range[0], snr_db_range[-1], 300)
+
+def smooth_curve(x, y, x_smooth):
+    spl = make_interp_spline(x, y, k=3)
+    return spl(x_smooth)
+
+mi_noirs_smooth = smooth_curve(snr_db_range, mi_noirs_all, snr_smooth)
+mi_perfect_smooth = smooth_curve(snr_db_range, mi_perfect_all, snr_smooth)
+mi_sbf_smooth = smooth_curve(snr_db_range, mi_sbf_all, snr_smooth)
+
+# ------------------------------------------------------------
+#  Plot all three curves together
+# ------------------------------------------------------------
+plt.figure(figsize=(9,6))
+plt.plot(snr_smooth, mi_noirs_smooth, '-', linewidth=2, color='red', label='Without IRS')
+plt.plot(snr_smooth, mi_sbf_smooth,   '-', linewidth=2, color='blue', label='With IRS (SBF algorithm)')
+plt.plot(snr_smooth, mi_perfect_smooth, '-', linewidth=2, color='green', label='With IRS (perfect alignment)')
+
+# Markers at original points
+plt.plot(snr_db_range, mi_noirs_all, 'o', color='red', markersize=6)
+plt.plot(snr_db_range, mi_sbf_all,   's', color='blue', markersize=6)
+plt.plot(snr_db_range, mi_perfect_all, '^', color='green', markersize=6)
+
+plt.xlabel('SNR (dB)', fontsize=12)
+plt.ylabel('Mutual Information (bits)', fontsize=12)
+#plt.title('Comparison of Secret Key Randomness Quality', fontsize=14)
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend(fontsize=11)
+plt.tight_layout()
+plt.savefig('mi_comparison_sbf.png', dpi=300)
+plt.show()
+
+print("\nFinal MI values at SNR = {} dB:".format(snr_db_range[-1]))
+print(f"  Without IRS:        {mi_noirs_all[-1]:.3f} bits")
+print(f"  With IRS (SBF):     {mi_sbf_all[-1]:.3f} bits")
+print(f"  With IRS (perfect): {mi_perfect_all[-1]:.3f} bits")
