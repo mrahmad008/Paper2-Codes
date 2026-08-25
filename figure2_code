@@ -1,0 +1,189 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+from sklearn.feature_selection import mutual_info_regression
+
+np.random.seed(42)
+
+# ------------------------------------------------------------
+#  Parameters (matching the paper's stated simulation setup,
+#  consistent with the Figure 3/4 script)
+# ------------------------------------------------------------
+p = 1.0
+beta = 0.3 + 0.4j
+num_samples = 1000          # matches Figures 3-6 sample count
+SNR_dB = 20
+sigma_n = np.sqrt(10.0 ** (-SNR_dB / 10.0))
+
+N = 256
+Ncp = 64
+L_max = 10
+Nt = N + Ncp
+
+M = 128
+SBF_iterations = 30
+delta = np.pi / 20   # perturbation range, eps_m(k) ~ U[-delta, delta]
+
+OUTPUT_DIR = "./outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ------------------------------------------------------------
+#  Helper functions
+# ------------------------------------------------------------
+def generate_channel_taps(L):
+    """Exponential PDP Rayleigh fading taps with 3 dB decay per tap."""
+    decay_per_tap_dB = 3.0
+    r = 10 ** (-decay_per_tap_dB / 10.0)
+    power = r ** np.arange(L)
+    power = power / np.sum(power)
+    taps = np.sqrt(power / 2) * (np.random.randn(L) + 1j * np.random.randn(L))
+    return taps
+
+def ofdm_symbol(N, Ncp):
+    data = (np.random.choice([1+1j, 1-1j, -1+1j, -1-1j], N) / np.sqrt(2))
+    ifft_out = np.fft.ifft(data, N) * np.sqrt(N)
+    cp = ifft_out[-Ncp:]
+    return np.concatenate([cp, ifft_out])
+
+def backscatter_waveform(Nt, bit=1):
+    if bit == 0:
+        return -np.ones(Nt, dtype=complex)
+    else:
+        w = np.ones(Nt, dtype=complex)
+        half = Nt // 2
+        w[half:] = -1
+        return w
+
+def extract_triangle_channel(y, N, Ncp, L_max):
+    start = L_max - 1
+    end = Ncp - 1
+    if start >= end:
+        start = 0
+        end = Ncp
+    J = end - start + 1
+    if J <= 0:
+        return 0.0
+    sum_abs = 0.0
+    for n in range(start, end + 1):
+        z_b = y[n] - y[n + N]
+        z_d = y[n] + y[n + N]
+        sum_abs += np.abs(z_b * z_d)
+    return sum_abs / J
+
+# ------------------------------------------------------------
+#  SBF algorithm (Algorithm 1), matching Eq. (37) exactly
+# ------------------------------------------------------------
+def sbf_algorithm(h1_I, g_I2, iterations, delta):
+    M = len(h1_I)
+    phi_best = np.random.uniform(0, 2 * np.pi, M)
+    u_best = np.abs(np.sum(h1_I * np.exp(1j * phi_best) * g_I2))
+    for k in range(iterations):
+        eps = np.random.uniform(-delta, delta, M)
+        phi_new = phi_best + eps
+        u_new = np.abs(np.sum(h1_I * np.exp(1j * phi_new) * g_I2))
+        if u_new > u_best:
+            u_best = u_new
+            phi_best = phi_new
+    return u_best
+
+def run_simulation(use_irs, num_samples):
+    v1_list, v2_list = [], []
+    L_h = max(1, L_max // 2)
+    for _ in range(num_samples):
+        h1_dir = generate_channel_taps(L_h)
+        h2_dir = generate_channel_taps(L_h)
+        h12_dir = generate_channel_taps(L_h)
+        g1 = h1_dir[0]
+        g2 = h2_dir[0]
+        direct_inward = h12_dir[0]
+
+        if use_irs:
+            h1_I = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
+            g_I2 = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
+            sbf_gain = sbf_algorithm(h1_I, g_I2, SBF_iterations, delta)
+            G12 = direct_inward + sbf_gain
+        else:
+            G12 = direct_inward
+
+        s_t = ofdm_symbol(N, Ncp)
+
+        b = backscatter_waveform(Nt, bit=1)
+        backscatter_T1 = beta * (s_t * g2) * b * G12
+        direct_T1 = s_t * g1
+        noise1 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
+        y1 = backscatter_T1 + direct_T1 + noise1
+
+        b = backscatter_waveform(Nt, bit=1)
+        backscatter_T2 = beta * (s_t * g1) * b * G12
+        direct_T2 = s_t * g2
+        noise2 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
+        y2 = backscatter_T2 + direct_T2 + noise2
+
+        v1 = extract_triangle_channel(y1, N, Ncp, L_max)
+        v2 = extract_triangle_channel(y2, N, Ncp, L_max)
+        v1_list.append(v1)
+        v2_list.append(v2)
+
+    return np.array(v1_list), np.array(v2_list)
+
+# ------------------------------------------------------------
+#  Run both scenarios
+# ------------------------------------------------------------
+v1_irs, v2_irs = run_simulation(True, num_samples)
+v1_no, v2_no = run_simulation(False, num_samples)
+
+corr_irs, _ = pearsonr(v1_irs, v2_irs)
+mi_irs = mutual_info_regression(v1_irs.reshape(-1, 1), v2_irs, random_state=42)[0]
+corr_no, _ = pearsonr(v1_no, v2_no)
+mi_no = mutual_info_regression(v1_no.reshape(-1, 1), v2_no, random_state=42)[0]
+
+print(f"Without IRS: corr={corr_no:.4f}, MI={mi_no:.4f} bits")
+print(f"With IRS (SBF algorithm): corr={corr_irs:.4f}, MI={mi_irs:.4f} bits")
+
+# ------------------------------------------------------------
+#  High-quality scatter plot (single combined window)
+# ------------------------------------------------------------
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 13,
+    "axes.linewidth": 1.1,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.major.size": 4,
+    "ytick.major.size": 4,
+})
+
+fig, ax = plt.subplots(1, 1, figsize=(6.2, 5.4), dpi=300)
+
+v1_no_n = v1_no / v1_no.max()
+v2_no_n = v2_no / v2_no.max()
+v1_irs_n = v1_irs / v1_irs.max()
+v2_irs_n = v2_irs / v2_irs.max()
+
+ax.scatter(v1_no_n, v2_no_n, s=8, alpha=0.45, edgecolors='none',
+           color='#e3342f', label='Without IRS', rasterized=True)
+ax.scatter(v1_irs_n, v2_irs_n, s=8, alpha=0.45, edgecolors='none',
+           color='#2f9e44', label='With IRS (SBF algorithm)', rasterized=True)
+ax.plot([0, 1], [0, 1], color='k', linestyle='--', linewidth=1.0,
+        alpha=0.6, label=r'$u_1=u_2$')
+
+ax.set_xlabel(r'$u_1$')
+ax.set_ylabel(r'$u_2$')
+ax.grid(True, linestyle=':', linewidth=0.7, alpha=0.6)
+ax.set_axisbelow(True)
+for spine in ax.spines.values():
+    spine.set_color('0.3')
+
+legend = ax.legend(loc='upper left', frameon=True, fontsize=10, markerscale=3)
+for lh in legend.legend_handles:
+    lh.set_alpha(1.0)
+
+plt.tight_layout()
+out_path = os.path.abspath(os.path.join(OUTPUT_DIR, 'figure2_comparison_scatter.png'))
+try:
+    plt.savefig(out_path, dpi=600, bbox_inches='tight')
+    print(f"Saved: {out_path}")
+except Exception as e:
+    print(f"FAILED to save figure: {e}")
+plt.show()
