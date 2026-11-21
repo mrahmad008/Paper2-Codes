@@ -1,0 +1,1248 @@
+
+import os
+import csv
+import numpy as np
+from scipy.stats import t as student_t
+from sklearn.feature_selection import mutual_info_regression
+
+
+# ============================================================
+# SBF SENSITIVITY ANALYSIS TABLE
+# ============================================================
+#
+# Purpose:
+# Evaluate the robustness of the proposed IRS-assisted
+# single-bit feedback (SBF) scheme under changes in:
+#
+#   1. Number of IRS reflecting elements (M)
+#   2. Feedback bit error probability (Pe)
+#   3. Feedback delay (Df)
+#   4. Number of SBF iterations (K)
+#   5. OFDM cyclic-prefix length (Ncp)
+#
+# Performance metric:
+# Mutual information between the legitimate tags'
+# noncoherent triangle-channel observations.
+#
+# Statistical methodology:
+#   - SNR fixed at 20 dB
+#   - 20 independent Monte Carlo runs
+#   - 5000 independent channel realizations per run
+#   - Student-t 95% confidence intervals
+#   - Paired comparisons with the reference configuration
+#
+# Outputs:
+#   - Summary CSV
+#   - Individual-run CSV
+#   - LaTeX sensitivity analysis table
+# ============================================================
+
+
+# ============================================================
+# 1. SIMULATION PARAMETERS
+# ============================================================
+
+# Base random seed.
+SEED = 42
+
+# Independent Monte Carlo repetitions.
+RUNS = 20
+
+# Channel realizations per repetition.
+NUM_SAMPLES = 5000
+
+# Fixed SNR for the sensitivity analysis.
+SNR_DB = 20.0
+
+# OFDM parameters.
+N = 256
+NCP_REF = 64
+L_MAX = 10
+
+# Reference IRS and SBF parameters.
+M_REF = 128
+K_REF = 30
+
+# Maximum phase perturbation.
+DELTA = np.pi / 20
+
+# Normalized ambient transmit power.
+P = 1.0
+
+# Complex backscatter reflection coefficient.
+BETA = 0.3 + 0.4j
+
+# Distance-dependent path-loss exponent.
+ETA = 3.0
+
+# Direct-link distances and channel tap counts.
+D_S1, D_S2, D_12 = 8.0, 7.0, 3.0
+TAU_S1, TAU_S2, TAU_12 = 8, 7, 3
+
+# Cascaded IRS link distances.
+D_1I, D_I2 = 3.0, 3.0
+
+
+# ============================================================
+# 2. FEEDBACK TIMING ASSUMPTIONS
+# ============================================================
+
+# The simulation adopts a quasi-static channel model.
+#
+# Each SBF iteration is assumed to require 1 ms before
+# additional feedback delay is considered.
+#
+# A fixed 30 ms training-time budget is assumed.
+#
+# These are modeling assumptions, not experimentally
+# measured feedback transmission or processing times.
+
+BASE_ITERATION_MS = 1.0
+TRAINING_BUDGET_MS = 30.0
+
+
+# ============================================================
+# 3. SENSITIVITY PARAMETER SWEEPS
+# ============================================================
+
+# Only one parameter changes at a time.
+# All remaining parameters use their reference values.
+
+SWEEPS = [
+
+    # Effect of IRS aperture size.
+    (
+        "IRS elements",
+        "M",
+        [4, 16, 32, 64, 128]
+    ),
+
+    # Probability that a feedback decision is flipped.
+    (
+        "Feedback error probability",
+        "Pe",
+        [0, 0.01, 0.05, 0.10, 0.20]
+    ),
+
+    # Additional delay per SBF feedback iteration.
+    (
+        "Feedback delay (ms)",
+        "Df",
+        [0, 1, 3, 5]
+    ),
+
+    # Number of requested phase perturbation iterations.
+    (
+        "SBF iterations",
+        "K",
+        [5, 10, 20, 30, 50, 100]
+    ),
+
+    # Number of OFDM cyclic-prefix samples.
+    (
+        "CP length",
+        "ncp",
+        [16, 32, 64, 128]
+    )
+]
+
+OUTPUT_DIR = "./outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ============================================================
+# 4. ORIGINAL CHANNEL AND PATH-LOSS MODEL
+# ============================================================
+
+def link_amp(distance):
+    """
+    Calculate distance-dependent channel amplitude.
+
+    Channel amplitude scales as distance^(-ETA/2),
+    corresponding to received power proportional
+    to distance^(-ETA).
+    """
+
+    return distance ** (-ETA / 2)
+
+
+def dominant_tap_variance(L, distance):
+    """
+    Calculate the average power of the first channel tap.
+
+    The multipath channel follows an exponentially
+    decaying power-delay profile with 3 dB/tap decay.
+
+    The total PDP is normalized to unit power before
+    applying distance-dependent path loss.
+    """
+
+    r = 10 ** (-3.0 / 10.0)
+
+    return (
+        link_amp(distance) ** 2
+        / np.sum(r ** np.arange(L))
+    )
+
+
+# ============================================================
+# 5. FIXED NOISE NORMALIZATION
+# ============================================================
+
+# Reference received backscatter power without IRS.
+#
+# The reference contains:
+#   - Ambient transmit power
+#   - Backscatter reflection coefficient
+#   - Source-to-T2 channel variance
+#   - Direct inter-tag channel variance
+#
+# Keeping this reference fixed permits comparisons
+# across different IRS and SBF configurations.
+
+BASELINE_POWER = (
+    P * abs(BETA) ** 2
+    * dominant_tap_variance(TAU_S2, D_S2)
+    * dominant_tap_variance(TAU_12, D_12)
+)
+
+# Complex AWGN standard deviation at 20 dB.
+SIGMA = np.sqrt(
+    BASELINE_POWER * 10 ** (-SNR_DB / 10)
+)
+
+
+def dominant_tap(L, distance, rng):
+    """
+    Generate a complex Gaussian dominant channel tap.
+
+    Its variance is determined by the exponential
+    PDP and the propagation distance.
+    """
+
+    variance = dominant_tap_variance(L, distance)
+
+    return np.sqrt(variance / 2) * (
+        rng.standard_normal()
+        + 1j * rng.standard_normal()
+    )
+
+
+# ============================================================
+# 6. OFDM AND RECEIVER NOISE GENERATION
+# ============================================================
+
+def ofdm_symbol(rng, ncp):
+    """
+    Generate a QPSK OFDM symbol.
+
+    The frequency-domain QPSK data are converted to
+    time-domain samples using an energy-normalized IFFT.
+
+    The final ncp samples are prepended as the CP.
+    """
+
+    choices = np.array([
+        1 + 1j,
+        1 - 1j,
+        -1 + 1j,
+        -1 - 1j
+    ])
+
+    # Unit-energy QPSK symbols.
+    data = rng.choice(choices, N) / np.sqrt(2)
+
+    # Normalized inverse FFT.
+    x = np.fft.ifft(data) * np.sqrt(N)
+
+    # Append the cyclic prefix.
+    return np.concatenate((x[-ncp:], x))
+
+
+def complex_noise(rng, nt):
+    """
+    Generate circularly symmetric complex AWGN.
+
+    Each real component has half the total
+    complex-noise variance.
+    """
+
+    return SIGMA * (
+        rng.standard_normal(nt)
+        + 1j * rng.standard_normal(nt)
+    ) / np.sqrt(2)
+
+
+# ============================================================
+# 7. IRS-ASSISTED COMPOSITE CHANNEL
+# ============================================================
+
+def composite_channel(g12, g1i, gi2, phi):
+    """
+    Calculate the effective inter-tag channel:
+
+    G12 = g12 + sum_m(g1i[m] * exp(j*phi[m]) * gi2[m])
+
+    The first term is the direct inter-tag path.
+
+    The summation represents the IRS-assisted
+    cascaded propagation channel.
+
+    No explicit CSI is used by the SBF algorithm
+    to choose its phase perturbations.
+    """
+
+    return (
+        g12
+        + np.sum(g1i * np.exp(1j * phi) * gi2)
+    )
+
+
+# ============================================================
+# 8. CP-BASED TRIANGLE-CHANNEL EXTRACTION
+# ============================================================
+
+def extract_triangle(y, cp_idx):
+    """
+    Extract the noncoherent triangle-channel statistic.
+
+    CP redundancy allows corresponding samples
+    separated by N positions to be combined.
+
+    Difference:
+        zb = y[n] - y[n+N]
+
+    Sum:
+        zd = y[n] + y[n+N]
+
+    The statistic is the average magnitude
+    of the product zb * zd.
+
+    This avoids explicit instantaneous CSI estimation.
+    """
+
+    zb = y[cp_idx] - y[cp_idx + N]
+    zd = y[cp_idx] + y[cp_idx + N]
+
+    return np.mean(np.abs(zb * zd))
+
+
+def feedback_observation(
+    G, g1, g2, pilot, b, cp_idx, rng
+):
+    """
+    Generate a noisy SBF feedback observation.
+
+    The received waveform consists of:
+      - Direct ambient RF signal
+      - Backscattered signal through composite channel G
+      - Complex Gaussian receiver noise
+
+    The CP-based statistic is used to compare
+    candidate IRS phase configurations.
+    """
+
+    y = (
+        pilot * g1
+        + BETA * pilot * g2 * b * G
+        + complex_noise(rng, len(pilot))
+    )
+
+    return extract_triangle(y, cp_idx)
+
+
+def reciprocal_observation(
+    G, g1, g2, s, b, cp_idx, rng
+):
+    """
+    Generate reciprocal triangle-channel observations.
+
+    Phase 1:
+      T2 backscatters the ambient signal to T1.
+
+    Phase 2:
+      T1 backscatters the ambient signal to T2.
+
+    Both legitimate observations share the same
+    effective inter-tag channel G.
+
+    Independent receiver noise is added to each.
+    """
+
+    nt = len(s)
+
+    # Received waveform at T1.
+    y1 = (
+        s * g1
+        + BETA * s * g2 * b * G
+        + complex_noise(rng, nt)
+    )
+
+    # Received waveform at T2.
+    y2 = (
+        s * g2
+        + BETA * s * g1 * b * G
+        + complex_noise(rng, nt)
+    )
+
+    return (
+        extract_triangle(y1, cp_idx),
+        extract_triangle(y2, cp_idx)
+    )
+
+
+# ============================================================
+# 9. MUTUAL INFORMATION ESTIMATION
+# ============================================================
+
+def mutual_information_bits(pairs):
+    """
+    Estimate MI between legitimate observations.
+
+    A k-nearest-neighbor-based MI estimator is used.
+
+    The estimator returns mutual information in nats.
+    Dividing by ln(2) converts the estimate into bits.
+
+    This is an empirical MI estimate, not an
+    analytical secret-key capacity expression.
+    """
+
+    x = pairs[:, 0]
+    y = pairs[:, 1]
+
+    # Avoid MI estimation from nearly constant data.
+    if (
+        np.std(x) < 1e-12
+        or np.std(y) < 1e-12
+    ):
+        return 0.0
+
+    mi_nats = mutual_info_regression(
+        x.reshape(-1, 1),
+        y,
+        n_neighbors=3,
+        random_state=SEED
+    )[0]
+
+    return max(
+        0.0,
+        float(mi_nats / np.log(2))
+    )
+
+
+# ============================================================
+# 10. FEEDBACK DELAY MODEL
+# ============================================================
+
+def effective_iterations(K, delay_ms):
+    """
+    Calculate the number of SBF iterations that can
+    be executed under the assumed timing model.
+
+    For zero feedback delay:
+        K_eff = K
+
+    For positive delay:
+        K_eff = min(
+            K,
+            floor(T_budget / (T_base + Df))
+        )
+
+    where:
+        T_budget = 30 ms
+        T_base   = 1 ms
+        Df       = additional feedback delay
+
+    IMPORTANT:
+    This implementation applies the 30 ms budget
+    only when delay_ms > 0.
+
+    Therefore, at zero delay, K=50 and K=100
+    are executed without the training-budget limit.
+
+    This behavior is preserved from the original code.
+    """
+
+    if delay_ms == 0:
+        return K
+
+    return min(
+        K,
+        int(np.floor(
+            TRAINING_BUDGET_MS
+            / (BASE_ITERATION_MS + delay_ms)
+        ))
+    )
+
+
+# ============================================================
+# 11. SBF MONTE CARLO SIMULATION
+# ============================================================
+
+def simulate(
+    seed,
+    M=M_REF,
+    Pe=0.0,
+    Df=0.0,
+    K=K_REF,
+    ncp=NCP_REF
+):
+    """
+    Evaluate SBF mutual information for one parameter
+    configuration and one independent Monte Carlo run.
+
+    The function:
+      1. Generates independent fading channels.
+      2. Initializes IRS phases.
+      3. Executes noisy measurement-based SBF.
+      4. Applies feedback bit errors when Pe > 0.
+      5. Extracts reciprocal key-generation observations.
+      6. Estimates mutual information across realizations.
+
+    The same base run seed is reused for each
+    sensitivity setting to support paired comparisons.
+    """
+
+    # --------------------------------------------------------
+    # VALIDATE PARAMETERS
+    # --------------------------------------------------------
+
+    if not (1 <= M <= M_REF):
+        raise ValueError("Invalid M")
+
+    if not (0 <= Pe <= 1):
+        raise ValueError("Pe must lie in [0, 1]")
+
+    if not (L_MAX <= ncp <= N):
+        raise ValueError("Invalid CP length")
+
+    if K < 0 or Df < 0:
+        raise ValueError(
+            "K and Df must be nonnegative"
+        )
+
+    # Number of SBF iterations permitted by delay model.
+    k_eff = effective_iterations(K, Df)
+
+    # --------------------------------------------------------
+    # OFDM AND BACKSCATTER CONFIGURATION
+    # --------------------------------------------------------
+
+    # CP indices exclude the first L_MAX-1 samples.
+    cp_idx = np.arange(L_MAX - 1, ncp)
+
+    # Total OFDM symbol duration in samples.
+    nt = N + ncp
+
+    # Bipolar backscatter modulation waveform.
+    b = np.ones(nt, dtype=complex)
+    b[nt // 2:] = -1
+
+    # --------------------------------------------------------
+    # INDEPENDENT RANDOM GENERATORS
+    # --------------------------------------------------------
+
+    # Dedicated RNGs for:
+    #   - Channel generation
+    #   - SBF algorithm and receiver observations
+    #   - Feedback bit errors
+    #
+    # This separation prevents feedback-error draws
+    # from changing the underlying channel sequence.
+
+    channel_rng = np.random.default_rng(seed + 101)
+    algorithm_rng = np.random.default_rng(seed + 202)
+    feedback_rng = np.random.default_rng(seed + 303)
+
+    # Store reciprocal observations from T1 and T2.
+    pairs = np.empty((NUM_SAMPLES, 2))
+
+    # --------------------------------------------------------
+    # MONTE CARLO CHANNEL REALIZATIONS
+    # --------------------------------------------------------
+
+    for i in range(NUM_SAMPLES):
+
+        # ----------------------------------------------------
+        # GENERATE QUASI-STATIC DIRECT CHANNELS
+        # ----------------------------------------------------
+
+        g1 = dominant_tap(
+            TAU_S1, D_S1, channel_rng
+        )
+
+        g2 = dominant_tap(
+            TAU_S2, D_S2, channel_rng
+        )
+
+        g12 = dominant_tap(
+            TAU_12, D_12, channel_rng
+        )
+
+        # ----------------------------------------------------
+        # GENERATE CASCADED IRS CHANNELS
+        # ----------------------------------------------------
+
+        # Always generate 128 IRS channel coefficients.
+        # Smaller M values use the first M coefficients.
+        #
+        # This helps preserve common channel realizations
+        # when comparing different IRS element counts.
+
+        g1i_all = link_amp(D_1I) * (
+            channel_rng.standard_normal(M_REF)
+            + 1j * channel_rng.standard_normal(M_REF)
+        ) / np.sqrt(2)
+
+        gi2_all = link_amp(D_I2) * (
+            channel_rng.standard_normal(M_REF)
+            + 1j * channel_rng.standard_normal(M_REF)
+        ) / np.sqrt(2)
+
+        g1i = g1i_all[:M]
+        gi2 = gi2_all[:M]
+
+        # ----------------------------------------------------
+        # INITIAL IRS CONFIGURATION
+        # ----------------------------------------------------
+
+        # Generate one OFDM pilot for SBF optimization.
+        pilot = ofdm_symbol(algorithm_rng, ncp)
+
+        # Random initial phase configuration.
+        phi_best = algorithm_rng.uniform(
+            0, 2 * np.pi, M
+        )
+
+        # Initial effective composite channel.
+        G_best = composite_channel(
+            g12, g1i, gi2, phi_best
+        )
+
+        # Obtain the initial noisy CP-based metric.
+        best_metric = feedback_observation(
+            G_best,
+            g1, g2,
+            pilot, b, cp_idx,
+            algorithm_rng
+        )
+
+        # ----------------------------------------------------
+        # ONE-BIT SBF PHASE OPTIMIZATION
+        # ----------------------------------------------------
+
+        for _ in range(k_eff):
+
+            # Independently perturb each IRS phase.
+            perturbation = algorithm_rng.uniform(
+                -DELTA, DELTA, M
+            )
+
+            phi_new = phi_best + perturbation
+
+            # Effective channel for the candidate phases.
+            G_new = composite_channel(
+                g12, g1i, gi2, phi_new
+            )
+
+            # Obtain a noisy candidate measurement.
+            metric_new = feedback_observation(
+                G_new,
+                g1, g2,
+                pilot, b, cp_idx,
+                algorithm_rng
+            )
+
+            # ------------------------------------------------
+            # INTENDED ONE-BIT FEEDBACK
+            # ------------------------------------------------
+
+            # The coordinating tag generates a logical
+            # accept/reject decision:
+            #
+            #   b(k)=1: candidate metric is larger
+            #   b(k)=0: candidate is not an improvement
+            #
+            # This represents the information conveyed
+            # by one-bit feedback.
+
+            intended_bit = metric_new > best_metric
+
+            # ------------------------------------------------
+            # FEEDBACK BIT ERROR MODEL
+            # ------------------------------------------------
+
+            # A binary symmetric channel is assumed.
+            #
+            # With probability Pe, the intended feedback
+            # decision is inverted during delivery.
+            #
+            # The physical backscatter signaling waveform
+            # and feedback receiver are not simulated.
+
+            if Pe > 0:
+                flipped = (
+                    feedback_rng.random() < Pe
+                )
+            else:
+                flipped = False
+
+            # Feedback decision received by the controller.
+            received_bit = (
+                bool(intended_bit) ^ bool(flipped)
+            )
+
+            # ------------------------------------------------
+            # SIMPLIFIED SYNCHRONIZED-STATE ASSUMPTION
+            # ------------------------------------------------
+
+            # The receiver is assumed to know which phase
+            # configuration the controller actually accepts.
+            #
+            # Thus, a feedback error changes the accepted
+            # phase configuration, but the receiver and
+            # controller do not become permanently desynchronized.
+            #
+            # This corresponds to an idealized synchronized
+            # feedback/acknowledgement mechanism.
+            #
+            # Such synchronization overhead is not included
+            # in the numerical performance results.
+
+            if received_bit:
+
+                # Apply the candidate IRS configuration.
+                phi_best = phi_new
+                G_best = G_new
+
+                # Preserve the original update rule.
+                best_metric = metric_new
+
+        # ----------------------------------------------------
+        # RECIPROCAL KEY-GENERATION OBSERVATIONS
+        # ----------------------------------------------------
+
+        # Generate an OFDM symbol after SBF optimization.
+        s = ofdm_symbol(algorithm_rng, ncp)
+
+        # Extract the two legitimate observations.
+        pairs[i] = reciprocal_observation(
+            G_best,
+            g1, g2,
+            s, b, cp_idx,
+            algorithm_rng
+        )
+
+    # Estimate MI across all channel realizations.
+    return (
+        mutual_information_bits(pairs),
+        k_eff
+    )
+
+
+# ============================================================
+# 12. STUDENT-T CONFIDENCE INTERVAL
+# ============================================================
+
+def mean_confidence_interval(
+    values,
+    confidence=0.95
+):
+    """
+    Calculate a two-sided confidence interval for
+    the mean of independent run-level MI estimates.
+
+    Formula:
+        mean +/- t_critical * standard_error
+
+    The standard error is calculated using the
+    sample standard deviation with ddof=1.
+
+    This interval measures Monte Carlo variability
+    across independent repetitions.
+    """
+
+    values = np.asarray(values, dtype=float)
+
+    n = len(values)
+
+    if n < 2:
+        raise ValueError(
+            "At least two independent runs required"
+        )
+
+    # Mean MI across repetitions.
+    mean = np.mean(values)
+
+    # Standard error of the mean.
+    standard_error = (
+        np.std(values, ddof=1)
+        / np.sqrt(n)
+    )
+
+    # Student-t critical value.
+    critical = student_t.ppf(
+        (1 + confidence) / 2,
+        df=n - 1
+    )
+
+    margin = critical * standard_error
+
+    return (
+        float(mean),
+        float(mean - margin),
+        float(mean + margin)
+    )
+
+
+# ============================================================
+# 13. LATEX PARAMETER LABELS
+# ============================================================
+
+def latex_label(parameter):
+    """
+    Convert sensitivity parameter names into
+    LaTeX-compatible table labels.
+    """
+
+    labels = {
+
+        "IRS elements":
+            r"IRS elements ($M$)",
+
+        "Feedback error probability":
+            r"Feedback error ($P_e$)",
+
+        "Feedback delay (ms)":
+            r"Feedback delay (ms)",
+
+        "SBF iterations":
+            r"Iterations ($K$)",
+
+        "CP length":
+            r"CP length ($N_{cp}$)"
+    }
+
+    return labels[parameter]
+
+
+# ============================================================
+# 14. MAIN SENSITIVITY ANALYSIS
+# ============================================================
+
+def main():
+    """
+    Execute all five sensitivity parameter sweeps.
+
+    For every parameter setting:
+      1. Run 20 independent Monte Carlo repetitions.
+      2. Estimate mean MI and its 95% confidence interval.
+      3. Calculate paired MI differences from reference.
+      4. Convert the differences into percentage changes.
+      5. Save summary and individual-run results.
+      6. Generate a LaTeX table.
+    """
+
+    print("=" * 85)
+    print("SBF SENSITIVITY ANALYSIS WITH 95% CI")
+    print("=" * 85)
+
+    print("SNR:", SNR_DB, "dB")
+    print("Independent runs:", RUNS)
+    print("Samples per run:", NUM_SAMPLES)
+    print("Base iteration:", BASE_ITERATION_MS, "ms")
+    print("Training budget:", TRAINING_BUDGET_MS, "ms")
+
+    # --------------------------------------------------------
+    # GENERATE INDEPENDENT MONTE CARLO SEEDS
+    # --------------------------------------------------------
+
+    # Different seeds produce independent simulation runs.
+    #
+    # The same list of seeds is reused for each parameter
+    # setting to support paired statistical comparisons.
+
+    run_seeds = [
+        SEED + 100000 * (i + 1)
+        for i in range(RUNS)
+    ]
+
+    # --------------------------------------------------------
+    # COMPUTE REFERENCE CONFIGURATION
+    # --------------------------------------------------------
+
+    # Reference:
+    #   M = 128
+    #   Pe = 0
+    #   Df = 0 ms
+    #   K = 30
+    #   Ncp = 64
+
+    print("\nComputing reference configuration...")
+
+    reference_values = np.array([
+        simulate(seed)[0]
+        for seed in run_seeds
+    ])
+
+    # Reference mean MI and confidence interval.
+    ref_mean, ref_lower, ref_upper = (
+        mean_confidence_interval(reference_values)
+    )
+
+    print(
+        f"Reference MI = {ref_mean:.5f} bits"
+    )
+
+    print(
+        f"Reference 95% CI = "
+        f"[{ref_lower:.5f}, {ref_upper:.5f}]"
+    )
+
+    # Dictionary identifying the reference value
+    # of each sensitivity parameter.
+    reference_settings = {
+        "M": M_REF,
+        "Pe": 0.0,
+        "Df": 0,
+        "K": K_REF,
+        "ncp": NCP_REF
+    }
+
+    # Summary table rows.
+    output_rows = []
+
+    # Individual Monte Carlo run records.
+    raw_runs = []
+
+    # --------------------------------------------------------
+    # RUN THE FIVE PARAMETER SWEEPS
+    # --------------------------------------------------------
+
+    for parameter, argument, settings in SWEEPS:
+
+        print("\n" + "-" * 85)
+        print(parameter)
+        print("-" * 85)
+
+        for setting in settings:
+
+            # Check whether the current setting is
+            # identical to the reference configuration.
+            is_reference = (
+                setting == reference_settings[argument]
+            )
+
+            if is_reference:
+
+                # Reuse reference estimates to avoid
+                # repeating identical simulations.
+                mi_values = reference_values.copy()
+                k_eff = K_REF
+
+            else:
+
+                # Evaluate this setting using the
+                # same independent run seeds.
+                simulations = [
+                    simulate(
+                        seed,
+                        **{argument: setting}
+                    )
+                    for seed in run_seeds
+                ]
+
+                # Extract the MI estimate from each run.
+                mi_values = np.array([
+                    result[0]
+                    for result in simulations
+                ])
+
+                # Effective iteration count.
+                k_eff = simulations[0][1]
+
+            # ------------------------------------------------
+            # MEAN MI AND CONFIDENCE INTERVAL
+            # ------------------------------------------------
+
+            mi_mean, mi_lower, mi_upper = (
+                mean_confidence_interval(mi_values)
+            )
+
+            # ------------------------------------------------
+            # PAIRED DIFFERENCES FROM REFERENCE
+            # ------------------------------------------------
+
+            # Each run is paired with the reference
+            # estimate obtained using the same base seed.
+            differences = (
+                mi_values - reference_values
+            )
+
+            # Mean difference and its confidence interval.
+            diff_mean, diff_lower, diff_upper = (
+                mean_confidence_interval(differences)
+            )
+
+            # ------------------------------------------------
+            # RELATIVE PERCENTAGE CHANGE
+            # ------------------------------------------------
+
+            # Normalize the mean paired difference by
+            # the reference mean MI.
+            #
+            # Positive percentage:
+            #   higher MI than the reference.
+            #
+            # Negative percentage:
+            #   lower MI than the reference.
+
+            change = (
+                100 * diff_mean / ref_mean
+            )
+
+            # Convert paired difference CI bounds
+            # into percentage-change bounds.
+            change_lower = (
+                100 * diff_lower / ref_mean
+            )
+
+            change_upper = (
+                100 * diff_upper / ref_mean
+            )
+
+            # The reference mean is treated as a fixed
+            # normalization denominator in this calculation.
+            # Its estimation uncertainty is not separately
+            # propagated through the percentage ratio.
+
+            # ------------------------------------------------
+            # STORE SUMMARY TABLE RESULTS
+            # ------------------------------------------------
+
+            row = {
+
+                "Sensitivity parameter": parameter,
+
+                "Setting": f"{setting:g}",
+
+                "Mean SBF MI (bits)":
+                    f"{mi_mean:.5f}",
+
+                "95% CI lower":
+                    f"{mi_lower:.5f}",
+
+                "95% CI upper":
+                    f"{mi_upper:.5f}",
+
+                "Change from reference (%)":
+                    f"{change:+.2f}",
+
+                "Paired change CI lower (%)":
+                    f"{change_lower:+.2f}",
+
+                "Paired change CI upper (%)":
+                    f"{change_upper:+.2f}",
+
+                "Effective K": str(k_eff)
+            }
+
+            output_rows.append(row)
+
+            # ------------------------------------------------
+            # STORE INDIVIDUAL RUN RESULTS
+            # ------------------------------------------------
+
+            for run_number, (mi, reference) in enumerate(
+                zip(mi_values, reference_values),
+                start=1
+            ):
+
+                raw_runs.append({
+
+                    "Parameter": parameter,
+                    "Setting": setting,
+                    "Run": run_number,
+
+                    "MI bits": float(mi),
+
+                    "Reference MI bits":
+                        float(reference),
+
+                    "Paired difference bits":
+                        float(mi - reference)
+                })
+
+            # ------------------------------------------------
+            # PRINT RESULTS
+            # ------------------------------------------------
+
+            print(
+                f"Setting={setting:g} | "
+                f"MI={mi_mean:.5f} | "
+                f"95% CI=[{mi_lower:.5f}, "
+                f"{mi_upper:.5f}] | "
+                f"Change={change:+.2f}% | "
+                f"Paired 95% CI="
+                f"[{change_lower:+.2f}, "
+                f"{change_upper:+.2f}]% | "
+                f"K_eff={k_eff}",
+                flush=True
+            )
+
+    # ========================================================
+    # 15. SAVE SUMMARY RESULTS TO CSV
+    # ========================================================
+
+    csv_path = os.path.join(
+        OUTPUT_DIR,
+        "sbf_sensitivity_20db_20run_ci.csv"
+    )
+
+    # The summary CSV contains:
+    # - Parameter and setting
+    # - Mean MI
+    # - MI confidence interval
+    # - Percentage change from reference
+    # - Paired percentage-change confidence interval
+    # - Effective SBF iteration count
+
+    with open(csv_path, "w", newline="") as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=list(output_rows[0].keys())
+        )
+
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    # ========================================================
+    # 16. SAVE INDIVIDUAL MONTE CARLO RUN DATA
+    # ========================================================
+
+    raw_path = os.path.join(
+        OUTPUT_DIR,
+        "sbf_sensitivity_20db_raw_runs.csv"
+    )
+
+    # Saving run-level data allows independent
+    # recalculation of confidence intervals and
+    # paired differences.
+
+    with open(raw_path, "w", newline="") as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=list(raw_runs[0].keys())
+        )
+
+        writer.writeheader()
+        writer.writerows(raw_runs)
+
+    # ========================================================
+    # 17. GENERATE LATEX SENSITIVITY TABLE
+    # ========================================================
+
+    tex_path = os.path.join(
+        OUTPUT_DIR,
+        "sbf_sensitivity_20db_20run_ci.tex"
+    )
+
+    with open(tex_path, "w") as file:
+
+        # Document the simulation settings.
+        file.write(
+            "% SBF sensitivity at 20 dB; "
+            f"{RUNS} independent Monte Carlo runs.\n"
+        )
+
+        # Four-column LaTeX table.
+        file.write(
+            "\\begin{tabular}{llcc}\n"
+        )
+
+        file.write("\\hline\n")
+
+        # Table column headings.
+        file.write(
+            "Parameter & Setting & "
+            "MI (bits), 95\\% CI & "
+            "Change (\\%), paired 95\\% CI "
+            "\\\\\n"
+        )
+
+        file.write("\\hline\n")
+
+        # Group rows by sensitivity parameter.
+        for parameter, argument, settings in SWEEPS:
+
+            group = [
+                row for row in output_rows
+                if row["Sensitivity parameter"] == parameter
+            ]
+
+            for index, row in enumerate(group):
+
+                # Display the parameter label only once
+                # at the beginning of each parameter group.
+                if index == 0:
+                    name = latex_label(parameter)
+                else:
+                    name = ""
+
+                # Extract MI and confidence interval values.
+                mi = row["Mean SBF MI (bits)"]
+                lower = row["95% CI lower"]
+                upper = row["95% CI upper"]
+
+                # Extract percentage-change statistics.
+                change = row[
+                    "Change from reference (%)"
+                ]
+
+                change_lower = row[
+                    "Paired change CI lower (%)"
+                ]
+
+                change_upper = row[
+                    "Paired change CI upper (%)"
+                ]
+
+                # Write one LaTeX table row.
+                file.write(
+                    f"{name} & {row['Setting']} & "
+                    f"{mi} [{lower}, {upper}] & "
+                    f"{change} "
+                    f"[{change_lower}, {change_upper}] "
+                    "\\\\\n"
+                )
+
+            # Separate parameter groups.
+            file.write("\\hline\n")
+
+        file.write("\\end{tabular}\n")
+
+    # ========================================================
+    # 18. FINAL SUMMARY
+    # ========================================================
+
+    print("\n" + "=" * 85)
+    print("SENSITIVITY ANALYSIS COMPLETED")
+    print("=" * 85)
+
+    print("Reference mean MI:", ref_mean)
+    print("Reference 95% CI:", ref_lower, ref_upper)
+
+    print("\nSaved CSV:", csv_path)
+    print("Saved individual runs:", raw_path)
+    print("Saved LaTeX table:", tex_path)
+
+
+# ============================================================
+# EXECUTE THE SENSITIVITY ANALYSIS
+# ============================================================
+
+if __name__ == "__main__":
+    main()
