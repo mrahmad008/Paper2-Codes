@@ -17,9 +17,6 @@ The repository also includes simulations for mutual information (MI), bit disagr
 
 A Python-based simulation framework was developed to evaluate the proposed IRS phase-adjustment algorithms under the considered Indoor channel conditions. The following table summarizes the simulation parameters used in the numerical evaluations:
 
-
-## Simulation and System Parameters
-
 | Parameter | Value | Unit |
 |---|---|---|
 | Number of OFDM subcarriers ($N$) | 256 | -- |
