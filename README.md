@@ -42,9 +42,9 @@ A Python-based simulation framework was developed to evaluate the proposed IRS p
 
 ## Reproducibility: Figure and Table Mapping
 
-The following table maps each manuscript figure and simulation-generated table to its corresponding Python script and random seed(s).
+The following table maps each manuscript figure and simulation-generated table to its corresponding Python script and random seed.
 
-| Manuscript Item | Description | Python Script | Random Seed(s) |
+| Manuscript Item | Description | Python Script | Random Seed |
 |---|---|---|---|
 | Figure 2 | Scatter plot of normalized triangle-channel estimates | [`figure2_code`](figure2_code) | 42 |
 | Figure 3 | Mutual information between $u_1$ and $u_2$ vs. SNR | [`figure3_4_code`](figure3_4_code) | 42 |
