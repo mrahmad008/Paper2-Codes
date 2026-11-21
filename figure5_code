@@ -1,229 +1,2032 @@
+
 import os
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
-from sklearn.feature_selection import mutual_info_regression
+
 from scipy.interpolate import PchipInterpolator
-from tqdm import tqdm
+from scipy.stats import t as student_t
+from sklearn.feature_selection import mutual_info_regression
 
-#np.random.seed(42)
 
-# ------------------------------------------------------------
-#  Parameters (matching Table 1 / Figures 2-4's finalized setup)
-# ------------------------------------------------------------
+# ============================================================
+# FIGURE 5: MUTUAL INFORMATION VERSUS SNR
+# ============================================================
+#
+# This simulation compares four configurations:
+#
+# 1. Without IRS:
+#    Only the direct inter-tag propagation channel.
+#
+# 2. Proposed IRS-SBF:
+#    IRS phases are optimized using noisy CP-based
+#    triangle-channel observations and one-bit decisions.
+#
+# 3. IRS with perfect CSI:
+#    Ideal phase alignment using instantaneous channel
+#    coefficients. This is an upper-bound reference
+#    for the effective composite channel magnitude.
+#
+# 4. Liu-inspired IRS heuristic:
+#    Random IRS phase training, RSS-based measurements,
+#    entropy-bounded grouping, and time-slot switching.
+#
+# The benchmark is an adaptation to the present
+# ambient-backscatter triangle-channel system.
+#
+# The script also estimates confidence intervals at 20 dB.
+# ============================================================
+
+
+# ============================================================
+# 1. SIMULATION PARAMETERS
+# ============================================================
+
+# Random seed for the original three configurations.
+SEED = 42
+
+# Independent seed for the Liu-inspired benchmark.
+# Keeping the RNG streams separate prevents benchmark
+# operations from altering the original SBF/CSI results.
+LIU_SEED = 62001
+
+# Normalized ambient source transmit power.
 p = 1.0
-beta = 0.3 + 0.4j
-num_samples = 1000                  # channel realizations per SNR point
-snr_db_range = np.arange(0, 31, 5)  # 0,5,...,30 dB
 
+# Complex backscatter reflection coefficient.
+beta = 0.3 + 0.4j
+
+# Number of independent channel realizations per SNR.
+num_samples = 5000
+
+# SNR sweep from 0 to 30 dB.
+snr_db_range = np.arange(0, 31, 5)
+
+# OFDM system parameters.
 N = 256
 Ncp = 64
-L_max = 10          # l_c
+L_max = 10
 Nt = N + Ncp
 
+# IRS and stochastic beamforming parameters.
 M = 128
 SBF_iterations = 30
-delta = np.pi / 20   # eps_m(k) ~ U[-delta, delta]
+delta = np.pi / 20
+
+# Propagation path-loss exponent.
+ETA = 3.0
+
+# Direct link distances and channel tap counts.
+D_S1, D_S2, D_12 = 8.0, 7.0, 3.0
+TAU_S1, TAU_S2, TAU_12 = 8, 7, 3
+
+# Cascaded IRS link distances.
+D_1I, D_I2 = 3.0, 3.0
 
 OUTPUT_DIR = "./outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ------------------------------------------------------------
-#  Helper functions
-# ------------------------------------------------------------
-def generate_channel_taps(L):
-    """Exponential PDP Rayleigh fading taps with 3 dB decay per tap."""
-    decay_per_tap_dB = 3.0
-    r = 10 ** (-decay_per_tap_dB / 10.0)
+
+# ============================================================
+# 2. LIU-INSPIRED BENCHMARK PARAMETERS
+# ============================================================
+
+# The benchmark uses 31 training measurements:
+# one initial measurement plus 30 additional measurements.
+#
+# This matches the number of measurements used by the
+# original SBF procedure, although the signaling
+# protocols and processing operations are different.
+LIU_TRAINING = SBF_iterations + 1
+
+# Enable adaptive selection of quantization groups.
+LIU_ADAPTIVE_LEVELS = True
+
+# Fixed group count if adaptive selection is disabled.
+LIU_GROUPS = 2
+
+# Maximum permitted number of quantization groups.
+LIU_MAX_LEVELS = 8
+
+# Histogram bins for entropy estimation.
+# None selects Sturges' rule.
+LIU_ENTROPY_BINS = None
+
+# Number of IRS switching slots per coherence block.
+LIU_SLOTS = 8
+
+# IRS phase resolution:
+# 2 = binary phase states {0, pi}
+# 0 = continuous uniformly distributed phases.
+LIU_PHASE_STATES = 2
+
+# Metric used during benchmark training.
+# Options: "rss" or "triangle".
+LIU_TRAIN_METRIC = "rss"
+
+# Metric used for the benchmark MI comparison.
+LIU_KEY_METRIC = "rss"
+
+# Optionally display both RSS-based and triangle-based
+# benchmark MI curves.
+LIU_PLOT_BOTH = False
+
+# Exactly one randomly selected slot from each
+# independent channel block is used for MI estimation.
+LIU_MI_SELECTION = "one_slot_per_block"
+
+
+# ============================================================
+# 3. CONFIDENCE INTERVAL PARAMETERS
+# ============================================================
+
+# Enable repeated Monte Carlo experiments.
+RUN_CI = True
+
+# Confidence intervals are evaluated at 20 dB.
+CI_SNR_DB = 20
+
+# Number of independent simulation repetitions.
+CI_REPEATS = 20
+
+# Confidence level.
+CI_CONFIDENCE = 0.95
+
+# Seed separation between independent repetitions.
+CI_SEED_STEP = 100000
+
+
+# ============================================================
+# 4. CHANNEL GENERATION
+# ============================================================
+
+def generate_channel_taps(L, rng):
+    """
+    Generate an L-tap complex Rayleigh fading channel.
+
+    An exponentially decaying power-delay profile
+    with 3 dB reduction per tap is used.
+
+    The total average power across all taps is
+    normalized to unity.
+    """
+
+    r = 10 ** (-3.0 / 10.0)
+
+    # Exponential power-delay profile.
     power = r ** np.arange(L)
-    power = power / np.sum(power)
-    taps = np.sqrt(power / 2) * (np.random.randn(L) + 1j * np.random.randn(L))
-    return taps
+    power /= power.sum()
 
-def ofdm_symbol(N, Ncp):
-    data = (np.random.choice([1+1j, 1-1j, -1+1j, -1-1j], N) / np.sqrt(2))
-    ifft_out = np.fft.ifft(data, N) * np.sqrt(N)
-    cp = ifft_out[-Ncp:]
-    return np.concatenate([cp, ifft_out])
+    # Circularly symmetric complex Gaussian taps.
+    return np.sqrt(power / 2) * (
+        rng.standard_normal(L)
+        + 1j * rng.standard_normal(L)
+    )
 
-def backscatter_waveform(Nt, bit=1):
-    if bit == 0:
-        return -np.ones(Nt, dtype=complex)
-    else:
-        w = np.ones(Nt, dtype=complex)
-        half = Nt // 2
-        w[half:] = -1
-        return w
 
-def extract_triangle_channel(y, N, Ncp, L_max):
-    start = L_max - 1
-    end = Ncp - 1
-    if start >= end:
-        start = 0
-        end = Ncp
-    J = end - start + 1
-    if J <= 0:
-        return 0.0
-    sum_abs = 0.0
-    for n in range(start, end + 1):
-        z_b = y[n] - y[n + N]
-        z_d = y[n] + y[n + N]
-        sum_abs += np.abs(z_b * z_d)
-    return sum_abs / J
+def link_amp(distance):
+    """
+    Distance-dependent channel amplitude.
 
-def mutual_info_continuous(x, y):
-    mi_nats = mutual_info_regression(x.reshape(-1, 1), y, random_state=42)[0]
-    return mi_nats / np.log(2)
+    The amplitude follows d^(-ETA/2), corresponding
+    to received power proportional to d^(-ETA).
+    """
 
-# ------------------------------------------------------------
-#  SBF algorithm (Algorithm 1), matching Eq. (37) exactly:
-#  phi_m(k+1) = phi_best,m + eps_m(k),  eps_m(k) ~ U[-delta, delta]
-# ------------------------------------------------------------
-def sbf_algorithm(h1_I, g_I2, iterations, delta):
-    M = len(h1_I)
-    phi_best = np.random.uniform(0, 2 * np.pi, M)
-    u_best = np.abs(np.sum(h1_I * np.exp(1j * phi_best) * g_I2))
-    for k in range(iterations):
-        eps = np.random.uniform(-delta, delta, M)
-        phi_new = phi_best + eps
-        u_new = np.abs(np.sum(h1_I * np.exp(1j * phi_new) * g_I2))
-        if u_new > u_best:
-            u_best = u_new
+    return distance ** (-ETA / 2)
+
+
+def dominant_tap_channel(L, distance, rng):
+    """
+    Generate the effective scalar channel from the
+    first fading tap and apply distance-based path loss.
+    """
+
+    return (
+        generate_channel_taps(L, rng)[0]
+        * link_amp(distance)
+    )
+
+
+def dominant_tap_variance(L, distance):
+    """
+    Analytical variance of the first fading tap.
+
+    Used to calculate the reference backscatter power
+    for consistent noise normalization.
+    """
+
+    r = 10 ** (-3.0 / 10.0)
+
+    return (
+        link_amp(distance) ** 2
+        / np.sum(r ** np.arange(L))
+    )
+
+
+# ============================================================
+# 5. NOISE POWER NORMALIZATION
+# ============================================================
+
+# Reference power of the no-IRS backscatter link.
+#
+# It depends on:
+# - Ambient source transmit power
+# - Backscatter reflection coefficient
+# - Source-to-T2 channel variance
+# - Direct inter-tag channel variance
+#
+# The same reference is used for all schemes.
+
+baseline_power = (
+    p * abs(beta) ** 2
+    * dominant_tap_variance(TAU_S2, D_S2)
+    * dominant_tap_variance(TAU_12, D_12)
+)
+
+
+def noise_std(snr_db):
+    """
+    Convert SNR in dB into complex-noise standard
+    deviation using the fixed reference power.
+    """
+
+    return np.sqrt(
+        baseline_power * 10 ** (-snr_db / 10)
+    )
+
+
+# ============================================================
+# 6. OFDM AND BACKSCATTER SIGNAL GENERATION
+# ============================================================
+
+def ofdm_symbol(rng):
+    """
+    Generate a QPSK OFDM symbol with cyclic prefix.
+
+    The IFFT is scaled by sqrt(N) to maintain
+    the intended time-domain power normalization.
+    """
+
+    # Random QPSK frequency-domain symbols.
+    data = rng.choice(
+        np.array([
+            1 + 1j,
+            1 - 1j,
+            -1 + 1j,
+            -1 - 1j
+        ]),
+        N
+    ) / np.sqrt(2)
+
+    # Convert to time domain.
+    x = np.fft.ifft(data) * np.sqrt(N)
+
+    # Prepend the cyclic prefix.
+    return np.concatenate((x[-Ncp:], x))
+
+
+def backscatter_waveform():
+    """
+    Generate the bipolar backscatter modulation sequence.
+
+    The second half of the OFDM waveform is multiplied
+    by -1, enabling the CP-based observation operation.
+    """
+
+    b = np.ones(Nt, dtype=complex)
+    b[Nt // 2:] = -1
+
+    return b
+
+
+# Fixed modulation sequence used in all schemes.
+B = backscatter_waveform()
+
+# CP indices after excluding the initial samples
+# according to the assumed maximum channel delay.
+CP_INDICES = np.arange(L_max - 1, Ncp)
+
+
+def complex_noise(sigma_n, rng):
+    """
+    Generate circularly symmetric complex AWGN.
+
+    Real and imaginary components each contribute
+    half of the total complex-noise variance.
+    """
+
+    return sigma_n * (
+        rng.standard_normal(Nt)
+        + 1j * rng.standard_normal(Nt)
+    ) / np.sqrt(2)
+
+
+# ============================================================
+# 7. TRIANGLE-CHANNEL AND RSS EXTRACTION
+# ============================================================
+
+def extract_triangle_channel(y):
+    """
+    Extract the noncoherent triangle-channel statistic.
+
+    The cyclic prefix is compared with corresponding
+    OFDM samples separated by N positions.
+
+    The metric is the average magnitude of the product
+    of the difference and sum observations.
+
+    No explicit instantaneous CSI is required.
+    """
+
+    zb = y[CP_INDICES] - y[CP_INDICES + N]
+    zd = y[CP_INDICES] + y[CP_INDICES + N]
+
+    return np.mean(np.abs(zb * zd))
+
+
+def extract_rss(y):
+    """
+    Extract an RSS-like backscatter observation.
+
+    The difference between CP-related samples
+    suppresses their common component under the
+    idealized signal model.
+
+    The squared magnitude is averaged to obtain
+    the received-power-based statistic.
+    """
+
+    zb = y[CP_INDICES] - y[CP_INDICES + N]
+
+    return np.mean(np.abs(zb) ** 2)
+
+
+# ============================================================
+# 8. COMPOSITE IRS CHANNEL
+# ============================================================
+
+def composite_channel(g12, g1I, gI2, phi):
+    """
+    Calculate the effective inter-tag channel.
+
+    G12 = g12 + sum_m(g1I[m] * exp(j*phi[m]) * gI2[m])
+
+    The composite channel includes both the direct
+    inter-tag path and the IRS-reflected contribution.
+
+    No 1/sqrt(M) normalization is applied.
+    """
+
+    return (
+        g12
+        + np.sum(
+            g1I * np.exp(1j * phi) * gI2
+        )
+    )
+
+
+# ============================================================
+# 9. PERFECT-CSI IRS PHASE ALIGNMENT
+# ============================================================
+
+def perfect_alignment_channel(g12, g1I, gI2):
+    """
+    Calculate the ideal IRS-assisted channel using
+    perfect instantaneous CSI.
+
+    The IRS phase of each reflected component is
+    selected to align it with the direct channel.
+
+    This maximizes the composite channel magnitude
+    under the assumed continuous-phase model.
+
+    Unlike SBF, this reference requires knowledge
+    of the complex channel coefficients.
+    """
+
+    # Cascaded channel contribution of each IRS element.
+    reflected = g1I * gI2
+
+    # Align each reflected contribution with the
+    # phase of the direct inter-tag channel.
+    phi_opt = (
+        np.angle(g12)
+        - np.angle(reflected)
+    ) % (2 * np.pi)
+
+    return composite_channel(
+        g12, g1I, gI2, phi_opt
+    )
+
+
+# ============================================================
+# 10. NOISY SBF FEEDBACK OBSERVATION
+# ============================================================
+
+def feedback_observation(
+    G12, g1, g2, pilot, sigma_n, rng
+):
+    """
+    Generate a noisy CP-based triangle-channel
+    measurement at the coordinating tag T1.
+
+    The received signal includes:
+    - Direct ambient RF signal
+    - Backscattered signal through G12
+    - Complex Gaussian receiver noise
+
+    A fresh noise realization is generated for
+    every candidate IRS phase configuration.
+    """
+
+    y = (
+        pilot * g1
+        + beta * pilot * g2 * B * G12
+        + complex_noise(sigma_n, rng)
+    )
+
+    return extract_triangle_channel(y)
+
+
+# ============================================================
+# 11. MEASUREMENT-BASED ONE-BIT SBF
+# ============================================================
+
+def sbf_algorithm(
+    g12, g1I, gI2, g1, g2, sigma_n, rng
+):
+    """
+    Perform one-bit stochastic beamforming.
+
+    The algorithm optimizes IRS phases using noisy
+    triangle-channel measurements rather than CSI.
+
+    For each iteration:
+    1. Perturb the currently accepted IRS phases.
+    2. Measure the new triangle-channel statistic.
+    3. Compare the candidate with the stored metric.
+    4. Accept or reject the candidate configuration.
+
+    One logical binary feedback decision is required
+    per perturbation iteration.
+
+    The physical passive-backscatter feedback link,
+    feedback reception errors, and tag energy
+    consumption are not explicitly simulated here.
+
+    Returns:
+        G_best   : selected composite channel
+        accepted : number of accepted updates
+    """
+
+    # Generate a fixed pilot for this SBF optimization.
+    pilot = ofdm_symbol(rng)
+
+    # Random initial IRS phase configuration.
+    phi_best = rng.uniform(
+        0, 2 * np.pi, M
+    )
+
+    # Initial composite channel.
+    G_best = composite_channel(
+        g12, g1I, gI2, phi_best
+    )
+
+    # Initial noisy feedback metric.
+    metric_best = feedback_observation(
+        G_best, g1, g2,
+        pilot, sigma_n, rng
+    )
+
+    accepted = 0
+
+    # Sequential one-bit SBF iterations.
+    for _ in range(SBF_iterations):
+
+        # Perturb each IRS element independently.
+        phi_new = phi_best + rng.uniform(
+            -delta, delta, M
+        )
+
+        # Composite channel under candidate phases.
+        G_new = composite_channel(
+            g12, g1I, gI2, phi_new
+        )
+
+        # Evaluate the candidate using noisy CP feedback.
+        metric_new = feedback_observation(
+            G_new, g1, g2,
+            pilot, sigma_n, rng
+        )
+
+        # One-bit decision:
+        # b(k)=1 if the candidate observation improves.
+        # b(k)=0 otherwise.
+        #
+        # The ideal feedback decision is implemented
+        # directly by the following conditional statement.
+        if metric_new > metric_best:
+
+            # Accept the candidate phase configuration.
             phi_best = phi_new
-    return u_best
+            G_best = G_new
+            metric_best = metric_new
 
-# ------------------------------------------------------------
-#  Simulation for one SNR point (three cases: no-IRS, SBF, perfect)
-# ------------------------------------------------------------
-def simulate_one_snr(snr_db, num_samples, N, Ncp, L_max, M, sbf_iter, delta):
-    sigma_n = np.sqrt(10.0 ** (-snr_db / 10.0))
-    L_h = max(1, L_max // 2)
+            accepted += 1
 
-    mi_noirs_pairs, mi_perfect_pairs, mi_sbf_pairs = [], [], []
+    # For 30 iterations, 30 sequential logical feedback
+    # decisions are generated. Physical transmission
+    # through passive backscatter is not modeled.
 
-    for _ in range(num_samples):
-        h1_dir = generate_channel_taps(L_h)
-        h2_dir = generate_channel_taps(L_h)
-        h12_dir = generate_channel_taps(L_h)
-        g1 = h1_dir[0]
-        g2 = h2_dir[0]
-        direct_inward = h12_dir[0]
+    return G_best, accepted
 
-        h1_I = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
-        g_I2 = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
 
-        ideal_irs_gain = np.sum(np.abs(h1_I) * np.abs(g_I2))
-        sbf_gain = sbf_algorithm(h1_I, g_I2, sbf_iter, delta)
+# ============================================================
+# 12. LIU-INSPIRED RANDOM IRS PHASE GENERATION
+# ============================================================
 
-        G12_noirs = direct_inward
-        G12_perfect = direct_inward + ideal_irs_gain
-        G12_sbf = direct_inward + sbf_gain
+def liu_random_phases(rng):
+    """
+    Generate random IRS phase configurations for
+    the Liu-inspired benchmark.
 
-        s_t = ofdm_symbol(N, Ncp)
-        b = backscatter_waveform(Nt, bit=1)
+    When LIU_PHASE_STATES=2, the IRS elements use
+    binary phase shifts {0, pi}.
 
-        def get_triangle_estimate(G12):
-            back_T1 = beta * (s_t * g2) * b * G12
-            direct_T1 = s_t * g1
-            noise1 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
-            y1 = back_T1 + direct_T1 + noise1
-            u1 = extract_triangle_channel(y1, N, Ncp, L_max)
+    When LIU_PHASE_STATES=0, continuous random
+    phases are generated instead.
+    """
 
-            back_T2 = beta * (s_t * g1) * b * G12
-            direct_T2 = s_t * g2
-            noise2 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
-            y2 = back_T2 + direct_T2 + noise2
-            u2 = extract_triangle_channel(y2, N, Ncp, L_max)
-            return u1, u2
+    if LIU_PHASE_STATES and LIU_PHASE_STATES >= 2:
 
-        mi_noirs_pairs.append(get_triangle_estimate(G12_noirs))
-        mi_perfect_pairs.append(get_triangle_estimate(G12_perfect))
-        mi_sbf_pairs.append(get_triangle_estimate(G12_sbf))
+        return (
+            rng.integers(0, LIU_PHASE_STATES, M)
+            * (2 * np.pi / LIU_PHASE_STATES)
+        )
 
-    def compute_mi(pairs):
-        arr1 = np.array([pt[0] for pt in pairs])
-        arr2 = np.array([pt[1] for pt in pairs])
-        return mutual_info_continuous(arr1, arr2)
+    return rng.uniform(0, 2 * np.pi, M)
 
-    return (compute_mi(mi_noirs_pairs), compute_mi(mi_perfect_pairs),
-            compute_mi(mi_sbf_pairs))
 
-# ------------------------------------------------------------
-#  Run simulations over SNR range
-# ------------------------------------------------------------
-mi_noirs_all, mi_perfect_all, mi_sbf_all = [], [], []
+# ============================================================
+# 13. LIU TRAINING OBSERVATION
+# ============================================================
 
-for snr_db in tqdm(snr_db_range, desc="Simulating"):
-    mi_n, mi_p, mi_s = simulate_one_snr(
-        snr_db, num_samples, N, Ncp, L_max, M, SBF_iterations, delta)
-    mi_noirs_all.append(mi_n)
-    mi_perfect_all.append(mi_p)
-    mi_sbf_all.append(mi_s)
+def liu_training_observation(
+    G12, g1, g2, pilot, sigma_n, rng
+):
+    """
+    Generate the training measurement for one
+    randomly selected IRS configuration.
 
-# ------------------------------------------------------------
-#  Smooth curves (shape-preserving, avoids overshoot/dips)
-# ------------------------------------------------------------
-snr_smooth = np.linspace(snr_db_range[0], snr_db_range[-1], 300)
+    The received signal follows the same ambient
+    backscatter model as the original system.
 
-def smooth_curve(x, y, x_smooth):
-    return PchipInterpolator(x, y)(x_smooth)
+    The training objective can use either:
+    - RSS-like power statistic
+    - CP-based triangle-channel statistic
+    """
 
-mi_noirs_smooth = smooth_curve(snr_db_range, mi_noirs_all, snr_smooth)
-mi_perfect_smooth = smooth_curve(snr_db_range, mi_perfect_all, snr_smooth)
-mi_sbf_smooth = smooth_curve(snr_db_range, mi_sbf_all, snr_smooth)
+    y = (
+        pilot * g1
+        + beta * pilot * g2 * B * G12
+        + complex_noise(sigma_n, rng)
+    )
 
-# ------------------------------------------------------------
-#  Plot
-# ------------------------------------------------------------
-plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 13,
-    "axes.linewidth": 1.1,
-    "xtick.direction": "in",
-    "ytick.direction": "in",
-})
+    if LIU_TRAIN_METRIC == "rss":
+        return extract_rss(y)
 
-fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
+    return extract_triangle_channel(y)
 
-ax.plot(snr_smooth, mi_noirs_smooth, '-', linewidth=2, color='#e3342f')
-ax.plot(snr_db_range, mi_noirs_all, 'o', linestyle='None',
-        color='#e3342f', markersize=7, label='Without IRS')
 
-ax.plot(snr_smooth, mi_sbf_smooth, '-', linewidth=2, color='#2563eb')
-ax.plot(snr_db_range, mi_sbf_all, 's', linestyle='None',
-        color='#2563eb', markersize=7, label='With IRS (SBF algorithm)')
+# ============================================================
+# 14. ENTROPY-BOUNDED QUANTIZATION LEVELS
+# ============================================================
 
-ax.plot(snr_smooth, mi_perfect_smooth, '-', linewidth=2, color='#2f9e44')
-ax.plot(snr_db_range, mi_perfect_all, '^', linestyle='None',
-        color='#2f9e44', markersize=7, label='With IRS (perfect alignment)')
+def entropy_bounded_levels(metrics):
+    """
+    Estimate an entropy-based upper bound on the
+    number of quantization groups.
 
-ax.set_xlabel('SNR (dB)')
-ax.set_ylabel('Mutual Information (bits)')
-ax.grid(True, linestyle=':', linewidth=0.7, alpha=0.6)
-ax.set_axisbelow(True)
+    The training measurements are first represented
+    by a histogram-based empirical distribution.
 
-handles, labels = ax.get_legend_handles_labels()
-handles = [plt.Line2D([0], [0], color=h.get_color(), marker=h.get_marker(),
-                       linestyle='-', linewidth=2, markersize=7) for h in handles]
-ax.legend(handles, labels, loc='upper left', frameon=True, fontsize=11)
-for spine in ax.spines.values():
-    spine.set_color('0.3')
+    Shannon entropy is calculated as:
 
-plt.tight_layout()
-out_path = os.path.abspath(os.path.join(OUTPUT_DIR, 'figure5_mi_comparison_sbf.png'))
-try:
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
-    print(f"Saved: {out_path}")
-except Exception as e:
-    print(f"FAILED to save figure: {e}")
-plt.show()
+        H = -sum_i(p_i * log2(p_i))
 
-print(f"\nAt SNR = {snr_db_range[-1]} dB:")
-print(f"  Without IRS:        {mi_noirs_all[-1]:.3f} bits")
-print(f"  With IRS (SBF):     {mi_sbf_all[-1]:.3f} bits")
-print(f"  With IRS (perfect): {mi_perfect_all[-1]:.3f} bits")
+    The selected number of levels satisfies:
 
-print('\n--- Full MI table ---')
-for i, snr in enumerate(snr_db_range):
-    print(f'SNR={snr:2d} dB | No-IRS={mi_noirs_all[i]:.3f} | '
-          f'SBF={mi_sbf_all[i]:.3f} | Perfect={mi_perfect_all[i]:.3f} | '
-          f'SBF-Perfect gap={mi_perfect_all[i]-mi_sbf_all[i]:.3f}')
+        L <= 2^H
+
+    The number of levels is also limited by
+    LIU_MAX_LEVELS.
+
+    This histogram-based procedure is an adaptation
+    choice and not an exact reproduction of the
+    original benchmark's complete quantizer design.
+    """
+
+    T = len(metrics)
+
+    # Select the histogram resolution.
+    if LIU_ENTROPY_BINS is None:
+
+        # Sturges' histogram rule.
+        n_bins = int(
+            np.ceil(np.log2(T) + 1)
+        )
+
+    else:
+        n_bins = int(LIU_ENTROPY_BINS)
+
+    if n_bins < 1:
+        raise ValueError(
+            "LIU_ENTROPY_BINS must be >= 1."
+        )
+
+    # Estimate the empirical histogram distribution.
+    counts, _ = np.histogram(
+        metrics,
+        bins=n_bins
+    )
+
+    # Remove empty histogram bins.
+    prob = counts[counts > 0] / T
+
+    # Estimate Shannon entropy in bits.
+    entropy = -np.sum(
+        prob * np.log2(prob)
+    )
+
+    # Entropy-based maximum number of groups.
+    max_allowed = max(
+        1,
+        int(np.floor(2.0 ** entropy))
+    )
+
+    # Enforce the configured upper bound.
+    levels = min(
+        LIU_MAX_LEVELS,
+        max_allowed
+    )
+
+    return levels
+
+
+# ============================================================
+# 15. LIU-INSPIRED TRAINING AND SWITCHING HEURISTIC
+# ============================================================
+
+def liu_cp_heuristic(
+    g12, g1I, gI2, g1, g2, sigma_n, rng
+):
+    """
+    Implement the adapted Liu-inspired IRS heuristic.
+
+    Main processing stages:
+
+    1. Generate 31 random IRS configurations.
+    2. Obtain noisy training measurements.
+    3. Determine the number of quantization groups.
+    4. Partition measurements into equal-width groups.
+    5. Select IRS configurations for eight switching slots.
+
+    The procedure is adapted to the CP-based ambient
+    backscatter model used in this manuscript.
+
+    It is not a complete reproduction of Liu et al.'s
+    original secret-key-generation protocol.
+    """
+
+    if LIU_TRAINING < 2 or LIU_SLOTS < 1:
+        raise ValueError(
+            "Invalid Liu training or slot configuration."
+        )
+
+    # Generate one pilot for all training measurements.
+    pilot = ofdm_symbol(rng)
+
+    # Store the measured statistics.
+    metrics = np.empty(LIU_TRAINING)
+
+    # Store the corresponding composite channels.
+    channels = np.empty(
+        LIU_TRAINING,
+        dtype=complex
+    )
+
+    # --------------------------------------------------------
+    # STEP 1: TRAIN RANDOM IRS CONFIGURATIONS
+    # --------------------------------------------------------
+
+    for i in range(LIU_TRAINING):
+
+        # Generate a random IRS phase configuration.
+        phi = liu_random_phases(rng)
+
+        # Calculate its effective inter-tag channel.
+        channels[i] = composite_channel(
+            g12, g1I, gI2, phi
+        )
+
+        # Measure its noisy training statistic.
+        metrics[i] = liu_training_observation(
+            channels[i],
+            g1, g2,
+            pilot, sigma_n, rng
+        )
+
+    # --------------------------------------------------------
+    # STEP 2: SELECT THE NUMBER OF GROUPS
+    # --------------------------------------------------------
+
+    if LIU_ADAPTIVE_LEVELS:
+
+        # Estimate the permitted number of groups
+        # from the empirical measurement entropy.
+        n_levels = entropy_bounded_levels(
+            metrics
+        )
+
+    else:
+
+        # Use the configured fixed number of groups.
+        n_levels = int(LIU_GROUPS)
+
+    if n_levels < 1:
+        raise ValueError(
+            "Quantization-group count must be >= 1."
+        )
+
+    # Find the observed training range.
+    minimum = float(np.min(metrics))
+    maximum = float(np.max(metrics))
+
+    # --------------------------------------------------------
+    # STEP 3: EQUAL-WIDTH GROUPING
+    # --------------------------------------------------------
+
+    # If all measurements are effectively equal,
+    # place every configuration into one group.
+    if (
+        n_levels == 1
+        or np.isclose(
+            minimum,
+            maximum,
+            rtol=0,
+            atol=1e-30
+        )
+    ):
+
+        membership = np.zeros(
+            LIU_TRAINING,
+            dtype=int
+        )
+
+    else:
+
+        # Calculate equal-width group intervals.
+        group_width = (
+            maximum - minimum
+        ) / n_levels
+
+        # Assign each measurement to a group.
+        # Clipping handles the maximum endpoint.
+        membership = np.minimum(
+            (
+                (metrics - minimum)
+                / group_width
+            ).astype(int),
+            n_levels - 1
+        )
+
+    # Identify groups containing training samples.
+    nonempty_groups = np.unique(
+        membership
+    )
+
+    # Map each nonempty group to its member indices.
+    members = {
+        int(g): np.flatnonzero(
+            membership == g
+        )
+        for g in nonempty_groups
+    }
+
+    # --------------------------------------------------------
+    # STEP 4: IRS TIME-SLOT SWITCHING
+    # --------------------------------------------------------
+
+    # Store the composite channel selected for each slot.
+    G_slots = np.empty(
+        LIU_SLOTS,
+        dtype=complex
+    )
+
+    for t in range(LIU_SLOTS):
+
+        # Randomly select one nonempty measurement group.
+        selected_group = int(
+            rng.choice(nonempty_groups)
+        )
+
+        # Randomly select one trained configuration
+        # belonging to that group.
+        selected_index = int(
+            rng.choice(
+                members[selected_group]
+            )
+        )
+
+        # Use its composite channel for this switching slot.
+        G_slots[t] = channels[selected_index]
+
+    return G_slots, n_levels
+
+
+# ============================================================
+# 16. RECIPROCAL TRIANGLE-CHANNEL OBSERVATIONS
+# ============================================================
+
+def triangle_pair(
+    G12, g1, g2, s, noise1, noise2
+):
+    """
+    Generate reciprocal observations at T1 and T2.
+
+    Phase 1: T2 backscatters and T1 receives.
+    Phase 2: T1 backscatters and T2 receives.
+
+    Both observations depend on the same effective
+    inter-tag channel G12.
+    """
+
+    # Observation at T1.
+    y1 = (
+        s * g1
+        + beta * s * g2 * B * G12
+        + noise1
+    )
+
+    # Observation at T2.
+    y2 = (
+        s * g2
+        + beta * s * g1 * B * G12
+        + noise2
+    )
+
+    return (
+        extract_triangle_channel(y1),
+        extract_triangle_channel(y2)
+    )
+
+
+def slot_statistics(
+    G12, g1, g2, s, noise1, noise2
+):
+    """
+    Generate both triangle-channel and RSS-like
+    observations for one benchmark switching slot.
+
+    Returns:
+      - Triangle observation at T1
+      - Triangle observation at T2
+      - RSS observation at T1
+      - RSS observation at T2
+    """
+
+    y1 = (
+        s * g1
+        + beta * s * g2 * B * G12
+        + noise1
+    )
+
+    y2 = (
+        s * g2
+        + beta * s * g1 * B * G12
+        + noise2
+    )
+
+    return (
+        extract_triangle_channel(y1),
+        extract_triangle_channel(y2),
+        extract_rss(y1),
+        extract_rss(y2)
+    )
+
+
+# ============================================================
+# 17. MUTUAL INFORMATION ESTIMATION
+# ============================================================
+
+def mutual_info_bits(x, y):
+    """
+    Estimate continuous-valued mutual information
+    using a k-nearest-neighbor-based estimator.
+
+    The estimator returns MI in nats.
+    Division by ln(2) converts the result to bits.
+
+    This is an empirical estimate of statistical
+    dependence, not an analytical secrecy rate.
+    """
+
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    # Avoid estimating MI from nearly constant data.
+    if (
+        np.std(x) < 1e-12
+        or np.std(y) < 1e-12
+    ):
+        return 0.0
+
+    mi_nats = mutual_info_regression(
+        x.reshape(-1, 1),
+        y,
+        n_neighbors=3,
+        random_state=SEED
+    )[0]
+
+    return max(
+        0.0,
+        mi_nats / np.log(2)
+    )
+
+
+# ============================================================
+# 18. LIU BENCHMARK MI SAMPLING
+# ============================================================
+
+def liu_mutual_information(
+    block_pairs,
+    selected_slots
+):
+    """
+    Estimate benchmark MI using one selected slot
+    from each independent channel block.
+
+    Expected input shape:
+        (num_samples, LIU_SLOTS, 2)
+
+    The two columns correspond to T1 and T2.
+
+    Selecting one slot per block avoids treating
+    all switching slots within the same channel
+    realization as independent fading blocks.
+
+    The same slot indices are used for RSS and
+    triangle-based benchmark comparisons.
+    """
+
+    expected_shape = (
+        num_samples,
+        LIU_SLOTS,
+        2
+    )
+
+    if block_pairs.shape != expected_shape:
+        raise ValueError(
+            "Unexpected Liu block-pair array shape."
+        )
+
+    # Extract one paired observation from each block.
+    selected = block_pairs[
+        np.arange(num_samples),
+        selected_slots,
+        :
+    ]
+
+    return mutual_info_bits(
+        selected[:, 0],
+        selected[:, 1]
+    )
+
+
+# ============================================================
+# 19. MONTE CARLO SIMULATION AT ONE SNR
+# ============================================================
+
+def simulate_one_snr(
+    snr_db,
+    rng,
+    liu_rng,
+    show_progress=True
+):
+    """
+    Evaluate the four schemes at one SNR value.
+
+    Original schemes:
+      - No IRS
+      - Proposed SBF
+      - Perfect CSI
+
+    Benchmark:
+      - Liu-inspired IRS heuristic
+
+    The original schemes share the same channel blocks,
+    OFDM waveform, and receiver noise realizations.
+
+    The benchmark uses a separate RNG for its training,
+    switching, and key-generation measurements.
+
+    This preserves the original random-number sequence
+    used by the No-IRS, SBF, and perfect-CSI methods.
+    """
+
+    sigma_n = noise_std(snr_db)
+
+    # --------------------------------------------------------
+    # STORAGE FOR ORIGINAL THREE SCHEMES
+    # --------------------------------------------------------
+
+    no_pairs = np.empty(
+        (num_samples, 2)
+    )
+
+    sbf_pairs = np.empty(
+        (num_samples, 2)
+    )
+
+    perfect_pairs = np.empty(
+        (num_samples, 2)
+    )
+
+    # --------------------------------------------------------
+    # STORAGE FOR LIU-INSPIRED BENCHMARK
+    # --------------------------------------------------------
+
+    # Triangle observations for all switching slots.
+    liu_tri = np.empty(
+        (num_samples * LIU_SLOTS, 2)
+    )
+
+    # RSS observations indexed by block and slot.
+    liu_rss = np.empty(
+        (num_samples, LIU_SLOTS, 2)
+    )
+
+    # Diagnostics for SBF optimization and grouping.
+    normalized_gains = np.empty(num_samples)
+    accepted_counts = np.empty(num_samples)
+    levels_used = np.empty(num_samples)
+
+    # --------------------------------------------------------
+    # MONTE CARLO CHANNEL REALIZATIONS
+    # --------------------------------------------------------
+
+    for k in range(num_samples):
+
+        # ----------------------------------------------------
+        # GENERATE DIRECT CHANNELS
+        # ----------------------------------------------------
+
+        g1 = dominant_tap_channel(
+            TAU_S1, D_S1, rng
+        )
+
+        g2 = dominant_tap_channel(
+            TAU_S2, D_S2, rng
+        )
+
+        g12 = dominant_tap_channel(
+            TAU_12, D_12, rng
+        )
+
+        # ----------------------------------------------------
+        # GENERATE CASCADED IRS CHANNELS
+        # ----------------------------------------------------
+
+        g1I = link_amp(D_1I) * (
+            rng.standard_normal(M)
+            + 1j * rng.standard_normal(M)
+        ) / np.sqrt(2)
+
+        gI2 = link_amp(D_I2) * (
+            rng.standard_normal(M)
+            + 1j * rng.standard_normal(M)
+        ) / np.sqrt(2)
+
+        # ----------------------------------------------------
+        # ORIGINAL THREE CONFIGURATIONS
+        # ----------------------------------------------------
+
+        # No IRS: direct inter-tag channel only.
+        G_noirs = g12
+
+        # Proposed SBF: noisy measurement-based optimization.
+        G_sbf, accepted = sbf_algorithm(
+            g12, g1I, gI2,
+            g1, g2, sigma_n, rng
+        )
+
+        # Perfect CSI: ideal coherent phase alignment.
+        G_perfect = perfect_alignment_channel(
+            g12, g1I, gI2
+        )
+
+        # Ratio of selected SBF channel power to the
+        # ideal perfect-CSI composite channel power.
+        normalized_gains[k] = (
+            abs(G_sbf) ** 2
+            / max(
+                abs(G_perfect) ** 2,
+                1e-15
+            )
+        )
+
+        accepted_counts[k] = accepted
+
+        # ----------------------------------------------------
+        # COMMON SIGNAL AND NOISE FOR ORIGINAL SCHEMES
+        # ----------------------------------------------------
+
+        # Using common waveform and noise realizations
+        # supports a paired comparison of the schemes.
+        s = ofdm_symbol(rng)
+
+        noise1 = complex_noise(sigma_n, rng)
+        noise2 = complex_noise(sigma_n, rng)
+
+        # Without IRS.
+        no_pairs[k] = triangle_pair(
+            G_noirs, g1, g2,
+            s, noise1, noise2
+        )
+
+        # With proposed SBF.
+        sbf_pairs[k] = triangle_pair(
+            G_sbf, g1, g2,
+            s, noise1, noise2
+        )
+
+        # With perfect CSI.
+        perfect_pairs[k] = triangle_pair(
+            G_perfect, g1, g2,
+            s, noise1, noise2
+        )
+
+        # ----------------------------------------------------
+        # LIU-INSPIRED BENCHMARK
+        # ----------------------------------------------------
+
+        # Train random IRS configurations and select
+        # composite channels for the switching slots.
+        #
+        # The benchmark RNG is independent of the
+        # original simulation RNG.
+        G_slots, levels_used[k] = liu_cp_heuristic(
+            g12, g1I, gI2,
+            g1, g2, sigma_n, liu_rng
+        )
+
+        # ----------------------------------------------------
+        # BENCHMARK KEY-GENERATION SWITCHING SLOTS
+        # ----------------------------------------------------
+
+        for t in range(LIU_SLOTS):
+
+            # Independent OFDM waveform for this slot.
+            s_t = ofdm_symbol(liu_rng)
+
+            # Receiver noise for the two legitimate tags.
+            noise1_t = complex_noise(
+                sigma_n, liu_rng
+            )
+
+            noise2_t = complex_noise(
+                sigma_n, liu_rng
+            )
+
+            # Extract triangle and RSS observations.
+            u1, u2, r1, r2 = slot_statistics(
+                G_slots[t],
+                g1, g2,
+                s_t, noise1_t, noise2_t
+            )
+
+            # Store triangle observations.
+            liu_tri[
+                k * LIU_SLOTS + t
+            ] = (u1, u2)
+
+            # Store RSS observations.
+            liu_rss[k, t] = (r1, r2)
+
+        # Display progress during the main simulation.
+        if (
+            show_progress
+            and (k + 1) % 1000 == 0
+        ):
+
+            print(
+                f"SNR={snr_db:2d} dB: "
+                f"{k + 1}/{num_samples}",
+                flush=True
+            )
+
+    # --------------------------------------------------------
+    # MUTUAL INFORMATION OF ORIGINAL SCHEMES
+    # --------------------------------------------------------
+
+    mi_no = mutual_info_bits(
+        no_pairs[:, 0],
+        no_pairs[:, 1]
+    )
+
+    mi_sbf = mutual_info_bits(
+        sbf_pairs[:, 0],
+        sbf_pairs[:, 1]
+    )
+
+    mi_perfect = mutual_info_bits(
+        perfect_pairs[:, 0],
+        perfect_pairs[:, 1]
+    )
+
+    # --------------------------------------------------------
+    # BENCHMARK MI: ONE SLOT PER INDEPENDENT BLOCK
+    # --------------------------------------------------------
+
+    # Select one random switching slot for each
+    # independent channel realization.
+    selected_slots = liu_rng.integers(
+        0,
+        LIU_SLOTS,
+        size=num_samples
+    )
+
+    # Reshape triangle observations into:
+    # (channel blocks, switching slots, legitimate tags).
+    liu_tri_blocks = liu_tri.reshape(
+        num_samples,
+        LIU_SLOTS,
+        2
+    )
+
+    # Triangle-based benchmark MI.
+    mi_liu_tri = liu_mutual_information(
+        liu_tri_blocks,
+        selected_slots
+    )
+
+    # --------------------------------------------------------
+    # BENCHMARK RSS NORMALIZATION
+    # --------------------------------------------------------
+
+    # Normalize RSS measurements separately within
+    # each channel block and for each legitimate tag.
+    #
+    # This removes block-level scale differences
+    # before the benchmark RSS MI estimation.
+    rss_denominator = np.maximum(
+        np.mean(
+            liu_rss,
+            axis=1,
+            keepdims=True
+        ),
+        np.finfo(float).tiny
+    )
+
+    rss_norm = liu_rss / rss_denominator
+
+    # Estimate MI from the selected normalized RSS pairs.
+    mi_liu_rss = liu_mutual_information(
+        rss_norm,
+        selected_slots
+    )
+
+    # Select the configured benchmark key metric.
+    if LIU_KEY_METRIC == "rss":
+        mi_liu = mi_liu_rss
+    else:
+        mi_liu = mi_liu_tri
+
+    # Return MI values and optimization diagnostics.
+    return (
+        mi_no,
+        mi_sbf,
+        mi_perfect,
+        np.mean(normalized_gains),
+        np.mean(accepted_counts),
+        mi_liu,
+        mi_liu_rss,
+        mi_liu_tri,
+        np.mean(levels_used)
+    )
+
+
+# ============================================================
+# 20. FIGURE 5 PLOTTING
+# ============================================================
+
+def plot_figure5(results):
+    """
+    Plot MI versus SNR for the four configurations.
+
+    PCHIP interpolation produces smooth curves
+    between simulated SNR points.
+
+    Markers indicate the actual Monte Carlo results.
+    Interpolation is used for visualization only.
+    """
+
+    # Extract SNR and MI columns.
+    snr = results[:, 0]
+
+    mi_no = results[:, 1]
+    mi_sbf = results[:, 2]
+    mi_perfect = results[:, 3]
+    mi_liu = results[:, 6]
+
+    # Select the benchmark curve labels.
+    if LIU_KEY_METRIC == "rss":
+
+        liu_label = "With IRS (heuristic)"
+        other_label = "Liu heuristic (triangle key)"
+        mi_other = results[:, 8]
+
+    else:
+
+        liu_label = "Liu heuristic (triangle key)"
+        other_label = "Liu heuristic (RSS key)"
+        mi_other = results[:, 7]
+
+    # --------------------------------------------------------
+    # IEEE SINGLE-COLUMN FIGURE STYLE
+    # --------------------------------------------------------
+
+    mpl.rcParams.update({
+
+        "font.weight": "bold",
+        "axes.labelweight": "bold",
+        "axes.titleweight": "bold",
+
+        "axes.labelsize": 9,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+
+        "legend.fontsize": 8,
+        "mathtext.default": "regular",
+
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+
+        "axes.linewidth": 1.1,
+
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+
+        "xtick.major.size": 4,
+        "ytick.major.size": 4
+    })
+
+    fig, ax = plt.subplots(
+        figsize=(3.5, 2.5),
+        dpi=300
+    )
+
+    # Dense SNR grid for smooth plotting.
+    snr_smooth = np.linspace(
+        snr[0],
+        snr[-1],
+        300
+    )
+
+    # --------------------------------------------------------
+    # CURVE DEFINITIONS
+    # --------------------------------------------------------
+
+    # Each tuple contains:
+    # MI values, color, marker, legend label.
+    schemes = [
+
+        (
+            mi_no,
+            "#e3342f",
+            "o",
+            "Without IRS"
+        ),
+
+        (
+            mi_sbf,
+            "#2563eb",
+            "s",
+            "With IRS (SBF algorithm)"
+        ),
+
+        (
+            mi_perfect,
+            "#2f9e44",
+            "^",
+            "With IRS (perfect CSI)"
+        ),
+
+        (
+            mi_liu,
+            "#000000",
+            "D",
+            liu_label
+        )
+    ]
+
+    # Optionally include the secondary Liu metric.
+    if LIU_PLOT_BOTH:
+
+        schemes.append(
+            (
+                mi_other,
+                "#6b7280",
+                "v",
+                other_label
+            )
+        )
+
+    # --------------------------------------------------------
+    # PLOT MI CURVES AND SIMULATION MARKERS
+    # --------------------------------------------------------
+
+    for values, color, marker, label in schemes:
+
+        # Shape-preserving interpolation.
+        smooth = PchipInterpolator(
+            snr,
+            values
+        )(snr_smooth)
+
+        # Smooth interpolated line.
+        ax.plot(
+            snr_smooth,
+            smooth,
+            "-",
+            color=color,
+            linewidth=1.8
+        )
+
+        # Actual simulated MI points.
+        ax.plot(
+            snr,
+            values,
+            marker,
+            linestyle="None",
+            color=color,
+            markersize=5,
+            label=label
+        )
+
+    # --------------------------------------------------------
+    # AXIS LABELS AND GRID
+    # --------------------------------------------------------
+
+    ax.set_xlabel(
+        "SNR (dB)",
+        fontweight="bold"
+    )
+
+    ax.set_ylabel(
+        "Mutual Information (bits)",
+        fontweight="bold"
+    )
+
+    ax.grid(
+        True,
+        linestyle="--",
+        linewidth=0.6,
+        alpha=0.5
+    )
+
+    ax.set_axisbelow(True)
+
+    for spine in ax.spines.values():
+        spine.set_color("0.3")
+
+    for tick in (
+        ax.get_xticklabels()
+        + ax.get_yticklabels()
+    ):
+        tick.set_fontweight("bold")
+
+    # --------------------------------------------------------
+    # LEGEND FORMATTING
+    # --------------------------------------------------------
+
+    handles, labels = ax.get_legend_handles_labels()
+
+    # Combine line and marker styles in legend entries.
+    handles = [
+
+        plt.Line2D(
+            [0], [0],
+            color=h.get_color(),
+            marker=h.get_marker(),
+            linestyle="-",
+            linewidth=1.8,
+            markersize=5
+        )
+
+        for h in handles
+    ]
+
+    legend = ax.legend(
+        handles,
+        labels,
+        loc="lower right",
+        fontsize=6.5 if len(schemes) <= 4 else 6.0,
+
+        frameon=True,
+        fancybox=False,
+        edgecolor="black",
+        framealpha=1.0,
+
+        handlelength=2.2,
+        handletextpad=0.4,
+        borderpad=0.4
+    )
+
+    legend.get_frame().set_linewidth(1.2)
+
+    for label in legend.get_texts():
+        label.set_fontweight("bold")
+
+    fig.tight_layout(pad=0.4)
+
+    # --------------------------------------------------------
+    # SAVE PUBLICATION FIGURES
+    # --------------------------------------------------------
+
+    pdf_path = os.path.abspath(
+        os.path.join(
+            OUTPUT_DIR,
+            "figure5_mi_comparison.pdf"
+        )
+    )
+
+    png_path = os.path.abspath(
+        os.path.join(
+            OUTPUT_DIR,
+            "figure5_mi_comparison.png"
+        )
+    )
+
+    # Vector PDF output.
+    fig.savefig(
+        pdf_path,
+        format="pdf",
+        bbox_inches="tight",
+        facecolor="white"
+    )
+
+    # High-resolution PNG output.
+    fig.savefig(
+        png_path,
+        dpi=600,
+        bbox_inches="tight",
+        facecolor="white"
+    )
+
+    print("Saved PDF:", pdf_path)
+    print("Saved PNG:", png_path)
+
+    plt.show()
+
+
+# ============================================================
+# 21. STUDENT-T CONFIDENCE INTERVAL
+# ============================================================
+
+def mean_t_ci(
+    values,
+    confidence=CI_CONFIDENCE
+):
+    """
+    Calculate a two-sided Student-t confidence interval
+    for the mean of independent Monte Carlo estimates.
+
+    The interval is:
+
+      mean +/- t_critical * standard_error
+
+    The sample standard deviation uses ddof=1.
+
+    This interval summarizes variation across
+    independent simulation repetitions.
+    """
+
+    values = np.asarray(values, dtype=float)
+
+    n = len(values)
+
+    if n < 2:
+        raise ValueError(
+            "At least two independent runs are required."
+        )
+
+    # Sample mean.
+    mean = np.mean(values)
+
+    # Standard error of the sample mean.
+    standard_error = (
+        np.std(values, ddof=1)
+        / np.sqrt(n)
+    )
+
+    # Student-t critical value.
+    critical = student_t.ppf(
+        (1 + confidence) / 2,
+        df=n - 1
+    )
+
+    # Confidence interval half-width.
+    margin = critical * standard_error
+
+    return (
+        mean,
+        mean - margin,
+        mean + margin
+    )
+
+
+# ============================================================
+# 22. CONFIDENCE INTERVAL EXPERIMENT
+# ============================================================
+
+def run_ci_analysis():
+    """
+    Evaluate MI variability across independent
+    Monte Carlo simulation repetitions.
+
+    The comparison is performed at 20 dB using
+    20 independent runs.
+
+    Each run produces:
+      - Proposed SBF MI
+      - Liu-inspired benchmark MI
+      - Paired MI difference (SBF - Liu)
+
+    Student-t confidence intervals are calculated
+    across the independent run-level estimates.
+
+    Results are printed and saved to CSV.
+    """
+
+    records = np.empty((CI_REPEATS, 3))
+
+    print("\n" + "=" * 85)
+
+    print(
+        f"{CI_CONFIDENCE:.0%} CONFIDENCE INTERVALS "
+        f"AT {CI_SNR_DB} dB"
+    )
+
+    print(
+        f"Independent runs: {CI_REPEATS}; "
+        f"blocks per run: {num_samples}"
+    )
+
+    print("=" * 85)
+
+    # --------------------------------------------------------
+    # INDEPENDENT MONTE CARLO REPETITIONS
+    # --------------------------------------------------------
+
+    for i in range(CI_REPEATS):
+
+        # Independent RNG for the original methods.
+        rng = np.random.default_rng(
+            SEED + (i + 1) * CI_SEED_STEP
+        )
+
+        # Independent RNG for the Liu benchmark.
+        liu_rng = np.random.default_rng(
+            LIU_SEED + (i + 1) * CI_SEED_STEP
+        )
+
+        # Simulate all methods at the selected SNR.
+        result = simulate_one_snr(
+            CI_SNR_DB,
+            rng,
+            liu_rng,
+            show_progress=False
+        )
+
+        mi_sbf = float(result[1])
+        mi_liu = float(result[5])
+
+        # Store paired run-level results.
+        records[i] = (
+            mi_sbf,
+            mi_liu,
+            mi_sbf - mi_liu
+        )
+
+        print(
+            f"Run {i + 1:02d}/{CI_REPEATS} | "
+            f"SBF={mi_sbf:.5f} | "
+            f"Liu={mi_liu:.5f} | "
+            f"Difference={mi_sbf-mi_liu:+.5f}",
+            flush=True
+        )
+
+    # --------------------------------------------------------
+    # CALCULATE CONFIDENCE INTERVALS
+    # --------------------------------------------------------
+
+    print("\nFINAL 95% CONFIDENCE INTERVAL RESULTS")
+
+    comparisons = [
+
+        (
+            "Proposed SBF MI",
+            records[:, 0]
+        ),
+
+        (
+            "Liu adapted MI",
+            records[:, 1]
+        ),
+
+        (
+            "Paired MI difference (SBF - Liu)",
+            records[:, 2]
+        )
+    ]
+
+    for name, values in comparisons:
+
+        mean, lower, upper = mean_t_ci(values)
+
+        print(
+            f"{name:33s} | "
+            f"Mean={mean:.5f} bits | "
+            f"95% CI=[{lower:.5f}, {upper:.5f}]"
+        )
+
+    # --------------------------------------------------------
+    # SAVE CONFIDENCE INTERVAL DATA
+    # --------------------------------------------------------
+
+    csv_path = os.path.abspath(
+        os.path.join(
+            OUTPUT_DIR,
+            "figure5_liu_ci_20db.csv"
+        )
+    )
+
+    np.savetxt(
+        csv_path,
+        records,
+        delimiter=",",
+        comments="",
+        header=(
+            "MI_SBF_bits,"
+            "MI_Liu_CPAdapted_bits,"
+            "Paired_Difference_bits"
+        )
+    )
+
+    print("Saved CI results:", csv_path)
+
+    # --------------------------------------------------------
+    # INTERPRET THE PAIRED CONFIDENCE INTERVAL
+    # --------------------------------------------------------
+
+    _, lower, upper = mean_t_ci(
+        records[:, 2]
+    )
+
+    if lower > 0:
+
+        print(
+            "Paired CI is above zero: "
+            "detectable SBF MI advantage at 20 dB."
+        )
+
+    elif upper < 0:
+
+        print(
+            "Paired CI is below zero: "
+            "detectable Liu MI advantage at 20 dB."
+        )
+
+    else:
+
+        print(
+            "Paired CI includes zero: "
+            "difference not distinguishable at 95%."
+        )
+
+
+# ============================================================
+# 23. MAIN SIMULATION
+# ============================================================
+
+def main():
+    """
+    Execute the complete Figure 5 experiment.
+
+    The script:
+      1. Validates benchmark parameters.
+      2. Initializes independent random generators.
+      3. Runs the MI-versus-SNR simulation.
+      4. Saves numerical results to CSV.
+      5. Generates PDF and PNG figures.
+      6. Prints performance diagnostics.
+      7. Runs the optional confidence interval experiment.
+    """
+
+    # --------------------------------------------------------
+    # PARAMETER VALIDATION
+    # --------------------------------------------------------
+
+    if LIU_TRAIN_METRIC not in ("rss", "triangle"):
+        raise ValueError(
+            "LIU_TRAIN_METRIC must be rss or triangle."
+        )
+
+    if LIU_KEY_METRIC not in ("rss", "triangle"):
+        raise ValueError(
+            "LIU_KEY_METRIC must be rss or triangle."
+        )
+
+    if LIU_MAX_LEVELS < 1:
+        raise ValueError(
+            "LIU_MAX_LEVELS must be >= 1."
+        )
+
+    # --------------------------------------------------------
+    # INDEPENDENT RANDOM GENERATORS
+    # --------------------------------------------------------
+
+    # Original No-IRS, SBF, and perfect-CSI methods.
+    rng = np.random.default_rng(SEED)
+
+    # Liu-inspired benchmark.
+    liu_rng = np.random.default_rng(
+        LIU_SEED
+    )
+
+    # Ten output columns:
+    #
+    # 0: SNR
+    # 1: No-IRS MI
+    # 2: SBF MI
+    # 3: Perfect-CSI MI
+    # 4: Normalized SBF power gain
+    # 5: Mean accepted SBF updates
+    # 6: Selected Liu benchmark MI
+    # 7: Liu RSS-based MI
+    # 8: Liu triangle-based MI
+    # 9: Mean number of Liu groups
+    results = np.empty(
+        (len(snr_db_range), 10)
+    )
+
+    print("=" * 85)
+    print("FIGURE 5: MI COMPARISON WITH LIU ADAPTATION")
+    print("=" * 85)
+
+    print("Samples:", num_samples)
+    print("IRS elements:", M)
+    print("SBF iterations:", SBF_iterations)
+
+    print("Liu training:", LIU_TRAINING)
+    print("Liu switching slots:", LIU_SLOTS)
+    print("Liu phase states:", LIU_PHASE_STATES)
+
+    print("Liu training metric:", LIU_TRAIN_METRIC)
+    print("Liu key metric:", LIU_KEY_METRIC)
+
+    print("Liu MI selection:", LIU_MI_SELECTION)
+    print("Baseline power:", baseline_power)
+
+    # --------------------------------------------------------
+    # SNR SWEEP
+    # --------------------------------------------------------
+
+    for i, snr in enumerate(snr_db_range):
+
+        # Evaluate all four schemes at this SNR.
+        values = simulate_one_snr(
+            int(snr),
+            rng,
+            liu_rng
+        )
+
+        # Store the SNR and nine returned metrics.
+        results[i] = (snr, *values)
+
+        print(
+            f"SNR={snr:2d} | "
+            f"No IRS={values[0]:.4f} | "
+            f"SBF={values[1]:.4f} | "
+            f"Perfect={values[2]:.4f} | "
+            f"Liu={values[5]:.4f} | "
+            f"Gain={values[3]:.4f} | "
+            f"Accepted={values[4]:.2f} | "
+            f"Liu levels={values[8]:.2f}",
+            flush=True
+        )
+
+    # --------------------------------------------------------
+    # SAVE NUMERICAL RESULTS
+    # --------------------------------------------------------
+
+    csv_path = os.path.abspath(
+        os.path.join(
+            OUTPUT_DIR,
+            "figure5_measured_sbf_results.csv"
+        )
+    )
+
+    np.savetxt(
+        csv_path,
+        results,
+        delimiter=",",
+        comments="",
+        header=(
+            "SNR_dB,"
+            "MI_NoIRS_bits,"
+            "MI_SBF_bits,"
+            "MI_Perfect_bits,"
+            "Normalized_SBF_Power_Gain,"
+            "Mean_Accepted_Updates,"
+            "MI_Liu_selected_bits,"
+            "MI_Liu_RSSkey_bits,"
+            "MI_Liu_TriangleKey_bits,"
+            "Mean_Liu_Levels"
+        )
+    )
+
+    # --------------------------------------------------------
+    # GENERATE FIGURE 5
+    # --------------------------------------------------------
+
+    plot_figure5(results)
+
+    # --------------------------------------------------------
+    # PRINT MAIN COMPARISON RESULTS
+    # --------------------------------------------------------
+
+    print(
+        "\nSNR | No IRS MI | SBF MI | Perfect MI | "
+        "Liu MI | MI Gap | Normalized Gain | Accepted"
+    )
+
+    for row in results:
+
+        (
+            snr, no, sbf, perfect, gain,
+            accepted, liu, rss, tri, levels
+        ) = row
+
+        print(
+            f"{snr:3.0f} | "
+            f"{no:9.4f} | "
+            f"{sbf:6.4f} | "
+            f"{perfect:10.4f} | "
+            f"{liu:7.4f} | "
+            f"{perfect-sbf:+7.4f} | "
+            f"{gain:15.4f} | "
+            f"{accepted:8.2f}"
+        )
+
+    # --------------------------------------------------------
+    # PRINT SECONDARY BENCHMARK DIAGNOSTICS
+    # --------------------------------------------------------
+
+    print(
+        "\nSNR | Liu MI: RSS key | triangle key | "
+        "mean levels"
+    )
+
+    for row in results:
+
+        print(
+            f"{row[0]:3.0f} | "
+            f"{row[7]:.4f} | "
+            f"{row[8]:.4f} | "
+            f"{row[9]:.2f}"
+        )
+
+    print("Saved CSV:", csv_path)
+
+    # --------------------------------------------------------
+    # OPTIONAL CONFIDENCE INTERVAL ANALYSIS
+    # --------------------------------------------------------
+
+    # This experiment uses 20 independent repetitions
+    # at 20 dB and prints 95% confidence intervals.
+    #
+    # The confidence intervals are not drawn on Figure 5.
+    if RUN_CI:
+        run_ci_analysis()
+
+    print("\nSimulation completed.")
+
+
+# ============================================================
+# EXECUTE FIGURE 5 SIMULATION
+# ============================================================
+
+if __name__ == "__main__":
+    main()
