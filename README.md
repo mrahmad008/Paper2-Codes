@@ -46,7 +46,7 @@ The following table maps each manuscript figure and simulation-generated table t
 
 | Manuscript Item | Description | Python Script | Random Seed(s) |
 |---|---|---|---|
-| Figure 2 | Scatter plot of normalized triangle-channel estimates | [`fig2_code.py`](fig2_code.py) | 42 |
+| Figure 2 | Scatter plot of normalized triangle-channel estimates | [`figure2_code.py`](fig2_code.py) | 42 |
 | Figure 3 | Mutual information between $u_1$ and $u_2$ vs. SNR | [`fig2_code.py`](fig2_code.py) | 42 |
 | Figure 4 | Bit disagreement ratio after 1-bit median quantization vs. SNR. | [`fig2_code.py`](fig2_code.py) | 42 |
 | Figure 5 | Mutual information between $u_1$ and $u_2$ vs. SNR for four scenarios | [`fig2_code.py`](fig2_code.py) | 42 |
@@ -76,7 +76,7 @@ All simulation scripts in this repository are written in Python and rely on stan
 | **SciPy** | `1.16.3` | Numerical computations, interpolation, statistical analysis, and kNN-based information estimation |
 | **Matplotlib** | `3.10.0` | Generating MI, BDR, SBF convergence, and sensitivity analysis figures |
 | **pandas** | `2.2.3` | Organizing simulation results and exporting CSV files |
-| **scikit-learn** | `Not specified` | Mutual information estimation using `mutual_info_regression` |
+| **scikit-learn** | `1.6.1` | Mutual information estimation using `mutual_info_regression` |
 
 ### Quick Installation
 
