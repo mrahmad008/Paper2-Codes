@@ -47,12 +47,12 @@ The following table maps each manuscript figure and simulation-generated table t
 | Manuscript Item | Description | Python Script | Random Seed(s) |
 |---|---|---|---|
 | Figure 2 | Scatter plot of normalized triangle-channel estimates | [`figure2_code`](figure2_code) | 42 |
-| Figure 3 | Mutual information between $u_1$ and $u_2$ vs. SNR | [`fig2_code.py`](fig2_code.py) | 42 |
-| Figure 4 | Bit disagreement ratio after 1-bit median quantization vs. SNR. | [`fig2_code.py`](fig2_code.py) | 42 |
-| Figure 5 | Mutual information between $u_1$ and $u_2$ vs. SNR for four scenarios | [`fig2_code.py`](fig2_code.py) | 42 |
-| Figure 6 | Secret key rate vs. SNR for eavesdropping model 1 | [`fig2_code.py`](fig2_code.py) | 42 |
-| Figure 7 | Secret key rate vs. SNR for eavesdropping model 2 | [`fig2_code.py`](fig2_code.py) | 42 |
-| Table 2 | Sensitivity analysis of the proposed PHYL key generation algorithm at an SNR of 20 dB | [`fig2_code.py`](fig2_code.py) | 42 |
+| Figure 3 | Mutual information between $u_1$ and $u_2$ vs. SNR | [`figure3_4_code`](figure3_4_code) | 42 |
+| Figure 4 | Bit disagreement ratio after 1-bit median quantization vs. SNR. | [`figure3_4_code`](figure3_4_code) | 42 |
+| Figure 5 | Mutual information between $u_1$ and $u_2$ vs. SNR for four scenarios | [`figure5_code`](figure5_code) | 42 |
+| Figure 6 | Secret key rate vs. SNR for eavesdropping model 1 | [`figure6_7_code`](figure6_7_code) | 42 |
+| Figure 7 | Secret key rate vs. SNR for eavesdropping model 2 | [`figure6_7_code`](figure6_7_code) | 42 |
+| Table 2 | Sensitivity analysis of the proposed PHYL key generation algorithm at an SNR of 20 dB | [`Table2_code`](Table2_code) | 42 |
 
 
 ### Reproducibility Notes
