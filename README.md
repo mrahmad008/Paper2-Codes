@@ -27,11 +27,11 @@ A Python-based simulation framework was developed to evaluate the proposed IRS p
 | Power delay profile decay | 3 | dB/tap |
 | Normalized transmit power ($P$) | 1 | -- |
 | Path-loss exponent ($\eta$) | 3 | -- |
-| RF source–$T_1$ distance | 8 | m |
-| RF source–$T_2$ distance | 7 | m |
-| $T_1–T_2$ distance | 3 | m |
-| $T_1$–IRS distance | 3 | m |
-| IRS–$T_2$ distance | 3 | m |
+| RF source--$T_1$ distance | 8 | m |
+| RF source--$T_2$ distance | 7 | m |
+| $T_1--T_2$ distance | 3 | m |
+| $T_1$--IRS distance | 3 | m |
+| IRS--$T_2$ distance | 3 | m |
 | Downlink tap length ($l_{g_1}$) | 8 | samples |
 | Downlink tap length ($l_{g_2}$) | 7 | samples |
 | Direct $T_1$–$T_2$ tap length ($l_{g_{12}}$) | 3 | samples |
