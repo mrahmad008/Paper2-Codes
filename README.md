@@ -12,3 +12,34 @@ Three configurations are evaluated for physical-layer secret key generation:
 - **Perfect CSI:** The IRS phase shifts are optimized using perfect channel state information as an ideal benchmark.
 
 The repository also includes simulations for mutual information (MI), bit disagreement rate (BDR), SBF convergence, and parameter sensitivity using cyclic prefix-based triangle-channel extraction.
+
+## Simulation Setup
+
+A Python-based simulation framework was developed to evaluate the proposed IRS phase-adjustment algorithms under the considered Indoor channel conditions. The following table summarizes the simulation parameters used in the numerical evaluations:
+
+
+## Simulation and System Parameters
+
+| Parameter | Value | Unit |
+|---|---|---|
+| Number of OFDM subcarriers ($N$) | 256 | -- |
+| Cyclic-prefix length ($N_{cp}$) | 64 | samples |
+| Maximum backscattered channel spread ($l_{c_1}, l_{c_2}$) | 10 | samples |
+| Usable CP samples ($J$) | 55 | samples |
+| Number of IRS elements ($M$) | 128 | -- |
+| BT reflection coefficient ($\beta$) | $0.3+0.4j$ ($\|\beta\|=0.5$) | -- |
+| Power delay profile decay | 3 | dB/tap |
+| Normalized transmit power ($P$) | 1 | -- |
+| Path-loss exponent ($\eta$) | 3 | -- |
+| RF source–$T_1$ distance | 8 | m |
+| RF source–$T_2$ distance | 7 | m |
+| $T_1$–$T_2$ distance | 3 | m |
+| $T_1$–IRS distance | 3 | m |
+| IRS–$T_2$ distance | 3 | m |
+| Downlink tap length ($l_{g_1}$) | 8 | samples |
+| Downlink tap length ($l_{g_2}$) | 7 | samples |
+| Direct $T_1$–$T_2$ tap length ($l_{g_{12}}$) | 3 | samples |
+| SNR range | 0–30, step 5 | dB |
+| Channel realizations per SNR point | 5000 | -- |
+| Total number of SBF iterations ($K$) | 30 | -- |
+| SBF perturbation bound ($\delta$) | $\pi/20$ | rad |
