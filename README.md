@@ -51,4 +51,14 @@ The following table maps each manuscript figure and simulation-generated table t
 | Figure 4 | Bit disagreement ratio after 1-bit median quantization vs. SNR. | [`fig2_code.py`](fig2_code.py) | 42 |
 | Figure 5 | Mutual information between $u_1$ and $u_2$ vs. SNR for four scenarios | [`fig2_code.py`](fig2_code.py) | 42 |
 | Figure 6 | Secret key rate vs. SNR for eavesdropping model 1 | [`fig2_code.py`](fig2_code.py) | 42 |
-| Figure 6 | Secret key rate vs. SNR for eavesdropping model 2 | [`fig2_code.py`](fig2_code.py) | 42 |
+| Figure 7 | Secret key rate vs. SNR for eavesdropping model 2 | [`fig2_code.py`](fig2_code.py) | 42 |
+| Table 2 | Sensitivity analysis of the proposed PHYL key generation algorithm at an SNR of 20 dB | [`fig2_code.py`](fig2_code.py) | 42 |
+
+
+### Reproducibility Notes
+
+- All random seeds are fixed to support reproducible numerical experiments.
+- Figure 5 and Table 2 use an independent random seed for their paired-bootstrap confidence-interval analysis.
+- The scripts should be executed using the simulation parameters specified in the manuscript and the corresponding Python files.
+
+We added comments to the Python files to explain the purpose of each simulation, the main parameters, and the corresponding results in the manuscript.
