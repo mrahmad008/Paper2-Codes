@@ -22,7 +22,7 @@ from sklearn.feature_selection import mutual_info_regression
 #
 # Performance metric:
 # Mutual information between the legitimate tags'
-# noncoherent triangle-channel observations.
+# CP-based triangle-channel observations.
 #
 # Statistical methodology:
 #   - SNR fixed at 20 dB
@@ -34,7 +34,7 @@ from sklearn.feature_selection import mutual_info_regression
 # Outputs:
 #   - Summary CSV
 #   - Individual-run CSV
-#   - LaTeX sensitivity analysis table
+#   - sensitivity analysis table
 # ============================================================
 
 
