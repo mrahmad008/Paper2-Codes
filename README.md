@@ -46,7 +46,7 @@ The following table maps each manuscript figure and simulation-generated table t
 
 | Manuscript Item | Description | Python Script | Random Seed(s) |
 |---|---|---|---|
-| Figure 2 | Scatter plot of normalized triangle-channel estimates | [`figure2_code.py`](fig2_code.py) | 42 |
+| Figure 2 | Scatter plot of normalized triangle-channel estimates | [`figure2_code`](fig2_code.py) | 42 |
 | Figure 3 | Mutual information between $u_1$ and $u_2$ vs. SNR | [`fig2_code.py`](fig2_code.py) | 42 |
 | Figure 4 | Bit disagreement ratio after 1-bit median quantization vs. SNR. | [`fig2_code.py`](fig2_code.py) | 42 |
 | Figure 5 | Mutual information between $u_1$ and $u_2$ vs. SNR for four scenarios | [`fig2_code.py`](fig2_code.py) | 42 |
