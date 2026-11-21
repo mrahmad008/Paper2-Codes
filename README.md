@@ -1,1 +1,2 @@
-Simulation Codes for Physical Layer Secret Key Generation in IRS-Assisted Ambient Backscattered Wireless Communication Networks
+# Simulation Codes for Physical Layer Secret Key Generation in IRS-Assisted Ambient Backscattered Wireless Communication Networks
+This repository contains the Python-based simulation codes used to generate the simulation results presented in our study on Phase-shift Adjustments of Intelligent Reflecting Surface Elements in IRS-Assisted Backscatter Wireless Communication Networks. The repository is provided to support the reproducibility of the results reported in the manuscript.
