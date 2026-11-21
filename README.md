@@ -39,3 +39,11 @@ A Python-based simulation framework was developed to evaluate the proposed IRS p
 | Channel realizations per SNR point | 5000 | -- |
 | Total number of SBF iterations ($K$) | 30 | -- |
 | SBF perturbation bound ($\delta$) | $\pi/20$ | rad |
+
+## Reproducibility: Figure and Table Mapping
+
+The following table maps each manuscript figure and simulation-generated table to its corresponding Python script and random seed(s).
+
+| Manuscript Item | Description | Python Script | Random Seed(s) |
+|---|---|---|---|
+| Figure 2 | Scatter plot of normalized triangle-channel estimates | [`fig2_code.py`](fig2_code.py) | 42 |
