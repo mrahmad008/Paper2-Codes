@@ -1,394 +1,1503 @@
 
+import os
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
 from pathlib import Path
+from scipy.spatial import cKDTree
+from scipy.special import digamma
 from sklearn.feature_selection import mutual_info_regression
 
+
+# ============================================================
+# FIGURES 6 AND 7: IRS-ASSISTED SECRET KEY GENERATION
+# ============================================================
+#
+# Objective:
+# Evaluate the conditional mutual information between
+# legitimate backscatter tags in the presence of an
+# eavesdropper under two observation models.
+#
+# Figure 6:
+# Secret-key-rate proxy versus SNR for eavesdropper
+# observation model 1.
+#
+# Figure 7:
+# Secret-key-rate proxy versus SNR for eavesdropper
+# observation model 2.
+#
+# Compared configurations:
+#   1. Without IRS
+#   2. With IRS using the proposed SBF algorithm
+#
+# Spatial correlation factors:
+#   rho = 0.0: uncorrelated eavesdropper channels
+#   rho = 0.9: strongly correlated channels
+#
+# Key modeling assumptions:
+#   - Rayleigh fading with exponential PDP
+#   - Distance-dependent path loss
+#   - Dominant-tap flat-fading approximation
+#   - Noisy CP-based SBF feedback measurements
+#   - No explicit CSI for SBF phase optimization
+#   - Noisy complex eavesdropper channel estimates
+#
+# Statistical estimators:
+#   - kNN estimator for unconditional MI
+#   - Frenzel-Pompe estimator for conditional MI
+# ============================================================
+
+
+# ============================================================
+# 1. SIMULATION PARAMETERS
+# ============================================================
+
+# Fixed random seed for reproducibility.
 np.random.seed(42)
 
-# ============================================================
-# Fixed reproduction of manuscript Figures 6 and 7
-#
-# Fixes applied vs. the previous version:
-#   1. Channel generation: replaced the broken equivalent_scalar_channel()
-#      (which normalized by its own magnitude, giving a bounded,
-#      non-Rayleigh distribution) with taps[0], the correct CSCG /
-#      Rayleigh-distributed scalar channel used throughout Figures 2-5.
-#   2. SKR computation: replaced the Gaussian partial-correlation formula
-#      (only exact for jointly Gaussian data; U1,U2,Ud are magnitudes of
-#      products of complex Gaussians, i.e. NOT Gaussian) with a
-#      nonparametric, k-NN-based conditional MI estimator via quantile
-#      binning of Ud, consistent with the k-NN estimator (mutual_info_
-#      regression) already used for the unconditional MI in Figure 3.
-#      This guarantees I(U1;U2|Ud) is computed the same way I(U1;U2) is,
-#      removing the estimator mismatch that caused SKR > MI.
-# ============================================================
-
-# ------------------------------------------------------------
-# Simulation parameters (unchanged, matches Table 1)
-# ------------------------------------------------------------
+# Normalized ambient RF transmit power.
 p = 1.0
+
+# Complex backscatter reflection coefficient.
 beta = 0.3 + 0.4j
-num_samples = 1000
+
+# Number of independent fading realizations per
+# SNR/correlation configuration.
+#
+# Can be overridden using the SIM_SAMPLES
+# environment variable.
+num_samples = int(
+    os.getenv("SIM_SAMPLES", "5000")
+)
+
+# SNR sweep: 0, 5, 10, ..., 30 dB.
 snr_db_range = np.arange(0, 31, 5)
 
+# OFDM system parameters.
 N = 256
 Ncp = 64
 L_max = 10
+
+# Total OFDM symbol length including CP.
 Nt = N + Ncp
 
+# Number of ISI-free CP observations.
+J = Ncp - L_max + 1
+
+assert J == 55
+
+# Number of IRS reflecting elements.
 M = 128
+
+# Number of one-bit stochastic beamforming iterations.
 SBF_iterations = 30
+
+# Maximum random phase perturbation.
 delta = np.pi / 20
 
+# Eavesdropper spatial correlation coefficients.
 rho_values = [0.0, 0.9]
 
-OUTPUT_DIR = Path("./outputs")
+# Distance-dependent path-loss exponent.
+ETA = 3.0
+
+# Source-to-tag and direct inter-tag distances.
+D_S1 = 8.0
+D_S2 = 7.0
+D_12 = 3.0
+
+# Multipath channel tap counts.
+TAU_S1 = 8
+TAU_S2 = 7
+TAU_12 = 3
+
+# IRS-assisted propagation distances.
+D_1I = float(os.getenv("D_1I", "3.0"))
+D_I2 = float(os.getenv("D_I2", "3.0"))
+
+# IRS-to-eavesdropper distance.
+# Defaults to the same distance as D_1I.
+D_ID = float(
+    os.getenv("D_ID", str(D_1I))
+)
+
+# Output directory for figures and numerical results.
+OUTPUT_DIR = Path("outputs_fig6_7_final")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ------------------------------------------------------------
-# Channel / signal helpers
-# ------------------------------------------------------------
+# ============================================================
+# 2. CHANNEL MODEL
+# ============================================================
+
+def link_amp(distance):
+    """
+    Calculate the distance-dependent channel amplitude.
+
+    The propagation power decreases according to:
+
+        Received power proportional to d^(-ETA)
+
+    Therefore, the complex channel amplitude scales as:
+
+        d^(-ETA/2)
+    """
+
+    if distance <= 0:
+        raise ValueError(
+            "Distance must be positive."
+        )
+
+    return distance ** (-ETA / 2)
+
+
 def generate_channel_taps(L):
-    """Rayleigh multipath channel with exponential PDP, 3 dB decay/tap."""
-    decay_per_tap_db = 3.0
-    r = 10 ** (-decay_per_tap_db / 10.0)
-    power = r ** np.arange(L)
-    power = power / np.sum(power)
-    taps = np.sqrt(power / 2) * (np.random.randn(L) + 1j * np.random.randn(L))
-    return taps
-
-
-def dominant_tap_channel(L):
     """
-    FIX: return the first (dominant) tap directly, giving a proper
-    zero-mean CSCG scalar with Rayleigh-distributed magnitude -- matching
-    the channel model used in Figures 2-5, and consistent with the
-    system model's stated CSCG/Rayleigh assumption.
+    Generate an L-tap Rayleigh fading channel.
+
+    An exponentially decaying power-delay profile
+    with 3 dB power reduction per tap is assumed.
+
+    The tap powers are normalized so that their
+    sum equals unity before path loss is applied.
+
+    Each channel coefficient follows a circularly
+    symmetric complex Gaussian distribution.
     """
-    taps = generate_channel_taps(L)
-    return taps[0]
+
+    # Power ratio between consecutive taps.
+    r = 10 ** (-3.0 / 10.0)
+
+    # Exponential power-delay profile.
+    powers = r ** np.arange(L)
+
+    # Normalize total average channel power.
+    powers /= powers.sum()
+
+    # Generate independent complex Gaussian taps.
+    return np.sqrt(powers / 2) * (
+        np.random.randn(L)
+        + 1j * np.random.randn(L)
+    )
 
 
-def generate_correlated_scalar(ref, rho):
-    """Generate CSCG scalar correlated with 'ref' by rho."""
-    noise = (np.random.randn() + 1j * np.random.randn()) / np.sqrt(2)
-    return rho * ref + np.sqrt(max(0.0, 1.0 - rho ** 2)) * noise
+def dominant_tap_channel(L, distance):
+    """
+    Generate the effective scalar channel coefficient.
+
+    The first tap of the multipath Rayleigh channel
+    is selected as the dominant-tap approximation.
+
+    Distance-dependent path loss is then applied.
+
+    This reduces the multipath channel to one
+    complex coefficient for the simulation.
+    """
+
+    return (
+        generate_channel_taps(L)[0]
+        * link_amp(distance)
+    )
 
 
-def ofdm_symbol(N, Ncp):
-    data = np.random.choice([1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j], N) / np.sqrt(2)
-    x = np.fft.ifft(data, N) * np.sqrt(N)
-    cp = x[-Ncp:]
-    return np.concatenate([cp, x])
+def dominant_tap_variance(L, distance):
+    """
+    Calculate the expected power of the dominant tap.
+
+    The first-tap variance is determined by the
+    normalized exponential power-delay profile
+    and distance-dependent attenuation.
+    """
+
+    r = 10 ** (-3.0 / 10.0)
+
+    return (
+        link_amp(distance) ** 2
+        / np.sum(r ** np.arange(L))
+    )
 
 
-def backscatter_waveform(Nt, bit=1):
-    if bit == 0:
-        return -np.ones(Nt, dtype=complex)
-    waveform = np.ones(Nt, dtype=complex)
-    waveform[Nt // 2:] = -1
-    return waveform
+def correlated_channel(reference, rho, variance):
+    """
+    Generate a spatially correlated complex channel.
+
+    The correlated channel is modeled as:
+
+        h_corr = rho*h_ref
+                 + sqrt(1-rho^2)*sqrt(variance)*z
+
+    where z is an independent CN(0,1) variable.
+
+    rho = 0:
+        Independent channel realization.
+
+    rho = 0.9:
+        Strong correlation with the reference channel.
+
+    The model assumes real-valued rho in [0,1].
+    """
+
+    # Independent complex Gaussian component.
+    z = (
+        np.random.randn()
+        + 1j * np.random.randn()
+    ) / np.sqrt(2)
+
+    return (
+        rho * reference
+        + np.sqrt(max(0.0, 1 - rho ** 2))
+        * np.sqrt(variance) * z
+    )
 
 
-def extract_triangle_channel(y, N, Ncp, L_max):
-    start = L_max - 1
-    end = Ncp - 1
-    values = []
-    for n in range(start, end + 1):
-        z_b = y[n] - y[n + N]
-        z_d = y[n] + y[n + N]
-        values.append(np.abs(z_b * z_d))
-    return np.mean(values)
+# ============================================================
+# 3. OFDM SIGNAL GENERATION
+# ============================================================
+
+def ofdm_symbol():
+    """
+    Generate a QPSK-modulated OFDM symbol.
+
+    The frequency-domain symbols are converted
+    into the time domain using the inverse FFT.
+
+    A cyclic prefix of length Ncp is prepended.
+
+    The sqrt(N) factor maintains the intended
+    time-domain power normalization.
+    """
+
+    # Random QPSK frequency-domain symbols.
+    data = np.random.choice(
+        [
+            1 + 1j,
+            1 - 1j,
+            -1 + 1j,
+            -1 - 1j
+        ],
+        N
+    ) / np.sqrt(2)
+
+    # Generate time-domain OFDM samples.
+    x = np.fft.ifft(data) * np.sqrt(N)
+
+    # Prepend cyclic prefix.
+    return np.concatenate([
+        x[-Ncp:],
+        x
+    ])
 
 
-# ------------------------------------------------------------
-# Nonparametric MI / conditional MI (k-NN based, SAME estimator family
-# as Figure 3's mutual_info_regression -- the Kraskov/KSG k-NN approach)
-# ------------------------------------------------------------
-from scipy.spatial import cKDTree
-from scipy.special import digamma
+def backscatter_waveform():
+    """
+    Generate the bipolar backscatter modulation sequence.
 
+    The waveform uses two reflection states:
+        +1 and -1
+
+    A sign reversal is applied at the midpoint
+    of the complete OFDM symbol.
+
+    This sequence is retained from the original
+    simulation implementation.
+    """
+
+    b = np.ones(Nt, dtype=complex)
+
+    # Reverse the backscatter sign in the second half.
+    b[Nt // 2:] = -1
+
+    return b
+
+
+def extract_triangle_channel(y):
+    """
+    Extract the CP-based noncoherent triangle statistic.
+
+    The CP and corresponding OFDM samples are
+    separated by N sample positions.
+
+    Difference observation:
+        z_b = y[n] - y[n+N]
+
+    Sum observation:
+        z_d = y[n] + y[n+N]
+
+    Triangle-channel statistic:
+        mean(|z_b * z_d|)
+
+    The first L_max-1 CP samples are excluded
+    to avoid the assumed inter-symbol interference.
+
+    This operation does not require explicit
+    instantaneous CSI.
+    """
+
+    indices = np.arange(L_max - 1, Ncp)
+
+    # Difference between CP and repeated OFDM samples.
+    z_b = y[indices] - y[indices + N]
+
+    # Sum of the corresponding samples.
+    z_d = y[indices] + y[indices + N]
+
+    # Noncoherent triangle-channel observation.
+    return np.mean(np.abs(z_b * z_d))
+
+
+# ============================================================
+# 4. UNCONDITIONAL MUTUAL INFORMATION ESTIMATION
+# ============================================================
 
 def mi_knn(x, y):
-    """Unconditional MI via k-NN estimator -- IDENTICAL method to Figure 3."""
-    x = np.asarray(x, dtype=float).reshape(-1, 1)
-    y = np.asarray(y, dtype=float)
-    if np.std(x) < 1e-12 or np.std(y) < 1e-12:
-        return 0.0
-    mi_nats = mutual_info_regression(x, y, random_state=42)[0]
-    return max(0.0, mi_nats / np.log(2))
+    """
+    Estimate I(X;Y) using a kNN-based MI estimator.
 
+    The sklearn estimator returns MI in nats.
+
+    Division by ln(2) converts the result into bits.
+
+    This estimator is used to evaluate the
+    statistical dependence between the two
+    legitimate triangle-channel observations.
+    """
+
+    x = np.asarray(x).reshape(-1, 1)
+    y = np.asarray(y)
+
+    # Return zero if either variable has
+    # negligible sample variation.
+    if (
+        np.std(x) < 1e-12
+        or np.std(y) < 1e-12
+    ):
+        return 0.0
+
+    mi = mutual_info_regression(
+        x,
+        y,
+        random_state=42
+    )[0]
+
+    # Convert from nats to bits.
+    return max(
+        0.0,
+        mi / np.log(2)
+    )
+
+
+# ============================================================
+# 5. CONDITIONAL MUTUAL INFORMATION ESTIMATION
+# ============================================================
 
 def cond_mi_ksg(X, Y, Z, k=5):
     """
-    Conditional mutual information I(X;Y|Z) via the Frenzel-Pompe (2007)
-    extension of the Kraskov-Stogbauer-Grassberger (KSG) k-NN estimator --
-    the same k-NN estimator family underlying Figure 3's mutual_info_
-    regression (which implements the 2-variable KSG/Kraskov estimator).
-    Uses the FULL sample set directly (no binning, no sample-size
-    mismatch), so I(X;Y|Z) and I(X;Y) are estimated with the same
-    effective sample size and estimator family, avoiding the small-sample
-    bias that caused spurious SKR > MI violations under quantile binning.
-    """
-    def z(a):
-        a = np.asarray(a, dtype=float)
-        s = np.std(a)
-        return (a - np.mean(a)) / s if s > 1e-12 else np.zeros_like(a)
+    Estimate conditional mutual information:
 
-    x, y, zz = z(X), z(Y), z(Z)
-    n = len(x)
-    if n <= k + 1:
+        I(X;Y|Z)
+
+    using a Frenzel-Pompe-style kNN estimator.
+
+    Interpretation:
+        X = legitimate observation at T1
+        Y = legitimate observation at T2
+        Z = eavesdropper observation
+
+    Conditional MI measures the residual
+    statistical dependence between X and Y
+    after conditioning on Z.
+
+    The estimator uses:
+        - Chebyshev (maximum) distance
+        - k nearest neighbors
+        - Strict neighborhood boundaries
+        - Digamma-function correction
+
+    The result is converted from nats to bits.
+
+    Negative finite-sample estimates are clipped
+    to zero in the original implementation.
+    """
+
+    def standardize(a):
+        """
+        Standardize one observation variable
+        to zero mean and unit standard deviation.
+
+        This reduces sensitivity to differences
+        in the numerical scales of X, Y, and Z.
+        """
+
+        a = np.asarray(a, dtype=float)
+
+        s = np.std(a)
+
+        if s > 1e-12:
+            return (
+                a - np.mean(a)
+            ) / s
+
+        return np.zeros_like(a)
+
+    # Standardize the three variables.
+    x = standardize(X)
+    y = standardize(Y)
+    z = standardize(Z)
+
+    # Ensure sufficient samples for kNN estimation.
+    if len(x) <= k + 1:
         return 0.0
 
-    xyz = np.column_stack([x, y, zz])
-    xz = np.column_stack([x, zz])
-    yz = np.column_stack([y, zz])
-    zz2 = zz.reshape(-1, 1)
+    # Joint observation space (X,Y,Z).
+    xyz = np.column_stack([x, y, z])
 
+    # Conditional subspaces.
+    xz = np.column_stack([x, z])
+    yz = np.column_stack([y, z])
+
+    # Conditioning-variable space.
+    z_only = z.reshape(-1, 1)
+
+    # Construct a k-d tree in the joint space.
     tree_xyz = cKDTree(xyz)
-    # k-th nearest neighbor distance in the joint (X,Y,Z) space (Chebyshev norm)
-    dists, _ = tree_xyz.query(xyz, k=k + 1, p=np.inf)
-    eps = dists[:, -1]
 
-    tree_xz = cKDTree(xz)
-    tree_yz = cKDTree(yz)
-    tree_z = cKDTree(zz2)
+    # Determine the kth-nearest-neighbor distance
+    # using the maximum norm.
+    distances, _ = tree_xyz.query(
+        xyz,
+        k=k + 1,
+        p=np.inf
+    )
 
-    n_xz = tree_xz.query_ball_point(xz, r=eps, p=np.inf, return_length=True) - 1
-    n_yz = tree_yz.query_ball_point(yz, r=eps, p=np.inf, return_length=True) - 1
-    n_z = tree_z.query_ball_point(zz2, r=eps, p=np.inf, return_length=True) - 1
+    # Use a strict neighborhood boundary.
+    # nextafter moves the radius slightly below
+    # the kth-neighbor distance.
+    eps = np.nextafter(
+        distances[:, -1],
+        0.0
+    )
 
-    n_xz = np.maximum(n_xz, 0)
-    n_yz = np.maximum(n_yz, 0)
-    n_z = np.maximum(n_z, 0)
+    def neighbor_count(data):
+        """
+        Count neighboring samples within the
+        joint-space radius projected into a subspace.
 
-    cmi_nats = (digamma(k) - np.mean(digamma(n_xz + 1) + digamma(n_yz + 1) - digamma(n_z + 1)))
-    cmi_bits = max(0.0, cmi_nats / np.log(2))
-    return cmi_bits
+        The query includes the sample itself;
+        subtracting one excludes that sample.
+        """
+
+        tree = cKDTree(data)
+
+        return np.maximum(
+            tree.query_ball_point(
+                data,
+                r=eps,
+                p=np.inf,
+                return_length=True
+            ) - 1,
+            0
+        )
+
+    # Neighbor counts in conditional subspaces.
+    nxz = neighbor_count(xz)
+    nyz = neighbor_count(yz)
+    nz = neighbor_count(z_only)
+
+    # Frenzel-Pompe conditional MI estimator.
+    #
+    # The digamma terms correct for finite-sample
+    # neighbor counts in the projected spaces.
+    cmi = (
+        digamma(k)
+        - np.mean(
+            digamma(nxz + 1)
+            + digamma(nyz + 1)
+            - digamma(nz + 1)
+        )
+    )
+
+    # Convert nats to bits and clip negative estimates.
+    return max(
+        0.0,
+        cmi / np.log(2)
+    )
 
 
-def cond_mi_knn(U1, U2, Ud, n_bins=8):
-    """Kept for backward compatibility; no longer used (see cond_mi_ksg)."""
-    return cond_mi_ksg(U1, U2, Ud)
+# ============================================================
+# 6. SINGLE-BIT FEEDBACK ALGORITHM
+# ============================================================
 
+def sbf_algorithm(
+    g12,
+    g1I,
+    gI2,
+    g1,
+    g2,
+    sigma_n
+):
+    """
+    Perform measurement-based stochastic beamforming.
 
-# ------------------------------------------------------------
-# SBF algorithm (unchanged)
-# ------------------------------------------------------------
-def sbf_algorithm(g12_direct, g1_I, g_I2):
-    phi_best = np.random.uniform(0.0, 2.0 * np.pi, M)
+    The IRS phase configuration is optimized using
+    noisy CP-based triangle-channel observations.
 
-    def composite_channel(phi):
-        irs_component = np.sum(g1_I * np.exp(1j * phi) * g_I2) / np.sqrt(M)
-        return g12_direct + irs_component
+    Procedure:
+        1. Initialize random IRS phases.
+        2. Measure the initial triangle statistic.
+        3. Generate random phase perturbations.
+        4. Measure the candidate configuration.
+        5. Compare the candidate and stored metrics.
+        6. Accept the candidate if it improves the metric.
 
-    G_best = composite_channel(phi_best)
-    metric_best = np.abs(G_best)
+    One binary accept/reject decision is generated
+    during each perturbation iteration.
+
+    The simulation assumes ideal delivery of the
+    feedback decision to the IRS controller.
+
+    Physical passive-backscatter feedback transmission,
+    reception errors, and signaling energy are not
+    explicitly modeled in Figures 6 and 7.
+
+    Returns:
+        G_best:
+            Selected composite inter-tag channel.
+
+        phi_best:
+            Selected IRS phase configuration.
+    """
+
+    # Generate a fixed OFDM pilot for this SBF procedure.
+    pilot = ofdm_symbol()
+
+    # Generate the bipolar backscatter waveform.
+    b = backscatter_waveform()
+
+    # Direct ambient signal component.
+    direct = pilot * g1
+
+    def composite(phi):
+        """
+        Calculate the direct plus IRS-reflected channel.
+
+        The IRS contribution is coherently summed
+        using the current phase configuration.
+
+        No 1/sqrt(M) normalization is applied.
+        """
+
+        return (
+            g12
+            + np.sum(
+                g1I
+                * np.exp(1j * phi)
+                * gI2
+            )
+        )
+
+    def metric(G):
+        """
+        Evaluate a noisy CP-based SBF feedback metric.
+
+        A new AWGN realization is generated for
+        each phase configuration measurement.
+        """
+
+        noise = sigma_n * (
+            np.random.randn(Nt)
+            + 1j * np.random.randn(Nt)
+        ) / np.sqrt(2)
+
+        # Received waveform at the coordinating tag.
+        y = (
+            direct
+            + beta * pilot * g2 * b * G
+            + noise
+        )
+
+        return extract_triangle_channel(y)
+
+    # --------------------------------------------------------
+    # INITIAL IRS CONFIGURATION
+    # --------------------------------------------------------
+
+    # Initialize each IRS phase uniformly in [0, 2pi).
+    phi_best = np.random.uniform(
+        0,
+        2 * np.pi,
+        M
+    )
+
+    # Initial composite channel.
+    G_best = composite(phi_best)
+
+    # Initial noisy triangle-channel observation.
+    metric_best = metric(G_best)
+
+    # --------------------------------------------------------
+    # ITERATIVE STOCHASTIC BEAMFORMING
+    # --------------------------------------------------------
 
     for _ in range(SBF_iterations):
-        perturbation = np.random.uniform(-delta, delta, M)
-        phi_new = phi_best + perturbation
-        G_new = composite_channel(phi_new)
-        metric_new = np.abs(G_new)
+
+        # Perturb every IRS phase independently.
+        phi_new = (
+            phi_best
+            + np.random.uniform(
+                -delta,
+                delta,
+                M
+            )
+        )
+
+        # Composite channel under the candidate phases.
+        G_new = composite(phi_new)
+
+        # Noisy feedback metric for the candidate.
+        metric_new = metric(G_new)
+
+        # One-bit feedback decision:
+        #
+        # b(k) = 1 if the candidate metric improves.
+        # b(k) = 0 otherwise.
+        #
+        # The controller retains the candidate
+        # only when the received decision is positive.
+        #
+        # This idealized simulation directly implements
+        # the decision without modeling its RF delivery.
         if metric_new > metric_best:
+
+            # Accept candidate IRS phases.
             phi_best = phi_new
+
+            # Update the selected composite channel.
             G_best = G_new
+
+            # Update the stored feedback metric.
             metric_best = metric_new
 
     return G_best, phi_best
 
 
-# ------------------------------------------------------------
-# Simulation for one SNR and one rho
-# ------------------------------------------------------------
-def simulate_one_snr(snr_db, rho):
-    sigma_n = np.sqrt(10.0 ** (-snr_db / 10.0))
-    L_h = max(1, L_max // 2)
+# ============================================================
+# 7. MONTE CARLO SIMULATION FOR ONE SNR
+# ============================================================
 
-    U1_noirs, U2_noirs, Ud1_noirs, Ud2_noirs = [], [], [], []
-    U1_sbf, U2_sbf, Ud1_sbf, Ud2_sbf = [], [], [], []
+def simulate_one_snr(snr_db, rho):
+    """
+    Evaluate the legitimate and eavesdropper
+    observations at a specified SNR and correlation.
+
+    The function simulates:
+        - No-IRS configuration
+        - IRS-assisted SBF configuration
+        - Eavesdropper observation model 1
+        - Eavesdropper observation model 2
+
+    For each channel realization, the legitimate
+    and eavesdropper channel coefficients are
+    generated and the corresponding observations
+    are collected.
+
+    MI and conditional MI are estimated across
+    the Monte Carlo realizations.
+    """
+
+    # --------------------------------------------------------
+    # REFERENCE NOISE POWER
+    # --------------------------------------------------------
+
+    # Normalize noise against the average received
+    # backscatter power of the direct No-IRS link.
+    #
+    # The same noise normalization is applied
+    # to all schemes and eavesdropper models.
+    baseline_power = (
+        p * abs(beta)**2
+        * dominant_tap_variance(TAU_S2, D_S2)
+        * dominant_tap_variance(TAU_12, D_12)
+    )
+
+    # Complex receiver-noise standard deviation.
+    sigma_n = np.sqrt(
+        baseline_power * 10**(-snr_db / 10)
+    )
+
+    # --------------------------------------------------------
+    # STORAGE FOR NO-IRS OBSERVATIONS
+    # --------------------------------------------------------
+
+    U1_noirs, U2_noirs = [], []
+    Ud1_noirs, Ud2_noirs = [], []
+
+    # --------------------------------------------------------
+    # STORAGE FOR IRS-SBF OBSERVATIONS
+    # --------------------------------------------------------
+
+    U1_sbf, U2_sbf = [], []
+    Ud1_sbf, Ud2_sbf = [], []
+
+    # --------------------------------------------------------
+    # MONTE CARLO CHANNEL REALIZATIONS
+    # --------------------------------------------------------
 
     for _ in range(num_samples):
-        # Legitimate channels -- FIX: use dominant_tap_channel, not the
-        # broken equivalent_scalar_channel
-        g1 = dominant_tap_channel(L_h)
-        g2 = dominant_tap_channel(L_h)
-        g12_direct = dominant_tap_channel(L_h)
 
-        g1_I = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
-        g_I2 = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
+        # ----------------------------------------------------
+        # LEGITIMATE DIRECT CHANNELS
+        # ----------------------------------------------------
 
-        G12_sbf, theta_star = sbf_algorithm(g12_direct, g1_I, g_I2)
-        G12_noirs = g12_direct
+        # Ambient source to tag T1.
+        g1 = dominant_tap_channel(
+            TAU_S1,
+            D_S1
+        )
 
-        # Eavesdropper channels
-        g_d = generate_correlated_scalar(g1, rho)
+        # Ambient source to tag T2.
+        g2 = dominant_tap_channel(
+            TAU_S2,
+            D_S2
+        )
 
-        # Per the manuscript's OWN derivation (Eq. 28): proximity gives
-        # g_d ~ g1 and G_{1,d} ~ G_{2,1}, so G_{1,d} carries the injected
-        # proximity correlation with the composite channel, while G_{2,d}
-        # is Darth's independently measured multiplier used in the
-        # division attack u_1 ~ u_d^2 / G_{2,d}.
-        g1d_direct = generate_correlated_scalar(g12_direct, rho)
-        g2d_direct = (np.random.randn() + 1j * np.random.randn()) / np.sqrt(2)
+        # Direct inter-tag channel.
+        g12 = dominant_tap_channel(
+            TAU_12,
+            D_12
+        )
 
-        g_Id = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
-        phase = np.exp(1j * theta_star)
+        # ----------------------------------------------------
+        # IRS-ASSISTED CHANNELS
+        # ----------------------------------------------------
 
-        G1d_noirs = g1d_direct
-        G2d_noirs = g2d_direct
+        # Channel from T1 to the IRS.
+        g1I = link_amp(D_1I) * (
+            np.random.randn(M)
+            + 1j * np.random.randn(M)
+        ) / np.sqrt(2)
 
-        G1d_sbf = g1d_direct + np.sum(g_Id * phase * g1_I) / np.sqrt(M)
-        G2d_sbf = g2d_direct + np.sum(g_Id * phase * g_I2) / np.sqrt(M)
+        # Channel from IRS to T2.
+        gI2 = link_amp(D_I2) * (
+            np.random.randn(M)
+            + 1j * np.random.randn(M)
+        ) / np.sqrt(2)
 
-        s_t = ofdm_symbol(N, Ncp)
-        b = backscatter_waveform(Nt, bit=1)
+        # ----------------------------------------------------
+        # PROPOSED SBF OPTIMIZATION
+        # ----------------------------------------------------
 
-        def get_estimates(G12, G1d, G2d):
-            back_T1 = beta * (s_t * g2) * b * G12
-            direct_T1 = s_t * g1
-            noise1 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
-            y1 = back_T1 + direct_T1 + noise1
-            u1 = extract_triangle_channel(y1, N, Ncp, L_max)
+        # Optimize IRS phases using noisy measurements.
+        #
+        # The resulting phase configuration is also
+        # used to calculate the IRS-assisted channels
+        # observed by the eavesdropper.
+        G12_sbf, phi = sbf_algorithm(
+            g12,
+            g1I,
+            gI2,
+            g1,
+            g2,
+            sigma_n
+        )
 
-            back_T2 = beta * (s_t * g1) * b * G12
-            direct_T2 = s_t * g2
-            noise2 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
-            y2 = back_T2 + direct_T2 + noise2
-            u2 = extract_triangle_channel(y2, N, Ncp, L_max)
+        # ----------------------------------------------------
+        # EAVESDROPPER DIRECT CHANNELS
+        # ----------------------------------------------------
 
-            ud1_clean = np.abs(g_d * G2d * g2)
-            ud2_clean = np.abs(G1d * g1 * G2d * g2)
+        # Reference variance for source-to-T1 channel.
+        v_g1 = dominant_tap_variance(
+            TAU_S1,
+            D_S1
+        )
 
-            noise_d1 = sigma_n * np.abs((np.random.randn() + 1j * np.random.randn()) / np.sqrt(2))
-            noise_d2 = sigma_n * np.abs((np.random.randn() + 1j * np.random.randn()) / np.sqrt(2))
+        # Reference variance for inter-tag channel.
+        v_g12 = dominant_tap_variance(
+            TAU_12,
+            D_12
+        )
 
-            ud1 = ud1_clean + noise_d1
-            ud2 = ud2_clean + noise_d2
+        # Source-to-eavesdropper channel.
+        #
+        # Correlated with g1 according to rho.
+        gd = correlated_channel(
+            g1,
+            rho,
+            v_g1
+        )
+
+        # T1-to-eavesdropper direct channel.
+        #
+        # Correlated with the legitimate inter-tag
+        # channel g12.
+        g1d = correlated_channel(
+            g12,
+            rho,
+            v_g12
+        )
+
+        # T2-to-eavesdropper direct channel.
+        #
+        # Generated independently in this model.
+        g2d = np.sqrt(v_g12) * (
+            np.random.randn()
+            + 1j * np.random.randn()
+        ) / np.sqrt(2)
+
+        # ----------------------------------------------------
+        # CORRELATED IRS-TO-EAVESDROPPER CHANNEL
+        # ----------------------------------------------------
+
+        # Independent component of the IRS-to-
+        # eavesdropper channel.
+        gId_ind = link_amp(D_ID) * (
+            np.random.randn(M)
+            + 1j * np.random.randn(M)
+        ) / np.sqrt(2)
+
+        # Construct an IRS-to-eavesdropper channel
+        # correlated with the IRS-to-T2 channel.
+        #
+        # The amplitude ratio compensates for
+        # potentially different propagation distances.
+        gId = (
+            rho * gI2
+            * (
+                link_amp(D_ID)
+                / link_amp(D_I2)
+            )
+            + np.sqrt(
+                max(0.0, 1 - rho ** 2)
+            ) * gId_ind
+        )
+
+        # IRS phase response selected by SBF.
+        phase = np.exp(1j * phi)
+
+        # ----------------------------------------------------
+        # IRS-ASSISTED EAVESDROPPER CHANNELS
+        # ----------------------------------------------------
+
+        # Effective channel from T1 to eavesdropper.
+        G1d_sbf = (
+            g1d
+            + np.sum(
+                gId * phase * g1I
+            )
+        )
+
+        # Effective channel from T2 to eavesdropper.
+        G2d_sbf = (
+            g2d
+            + np.sum(
+                gId * phase * gI2
+            )
+        )
+
+        # ----------------------------------------------------
+        # OFDM SIGNAL AND RECEIVER NOISE
+        # ----------------------------------------------------
+
+        # Generate one OFDM waveform for both schemes.
+        s = ofdm_symbol()
+
+        # Backscatter modulation sequence.
+        b = backscatter_waveform()
+
+        # Independent AWGN at legitimate tag T1.
+        noise1 = sigma_n * (
+            np.random.randn(Nt)
+            + 1j * np.random.randn(Nt)
+        ) / np.sqrt(2)
+
+        # Independent AWGN at legitimate tag T2.
+        noise2 = sigma_n * (
+            np.random.randn(Nt)
+            + 1j * np.random.randn(Nt)
+        ) / np.sqrt(2)
+
+        # ----------------------------------------------------
+        # EAVESDROPPER CHANNEL ESTIMATION NOISE
+        # ----------------------------------------------------
+
+        def cnoise():
+            """
+            Generate scalar complex estimation noise.
+
+            This represents imperfect eavesdropper
+            channel knowledge rather than a complete
+            received-waveform or estimation protocol.
+            """
+
+            return sigma_n * (
+                np.random.randn()
+                + 1j * np.random.randn()
+            ) / np.sqrt(2)
+
+        # Estimation errors for direct channels.
+        egd = cnoise()
+        eg1 = cnoise()
+        eg2 = cnoise()
+
+        # Estimation errors for effective channels.
+        eG1d = cnoise()
+        eG2d = cnoise()
+
+        # ----------------------------------------------------
+        # LEGITIMATE AND EAVESDROPPER OBSERVATIONS
+        # ----------------------------------------------------
+
+        def observations(G12, G1d, G2d):
+            """
+            Generate the legitimate triangle-channel
+            observations and two eavesdropper statistics.
+
+            Legitimate tags use CP-based noncoherent
+            triangle-channel extraction.
+
+            The eavesdropper is modeled as having noisy
+            complex channel estimates.
+
+            Model 1:
+                Ud1 = |gd_hat * G2d_hat * g2_hat|
+
+            Model 2:
+                Ud2 = |G1d_hat * g1_hat
+                        * G2d_hat * g2_hat|
+
+            These are the specific observation proxies
+            used in the supplied simulation.
+            """
+
+            # -----------------------------------------------
+            # LEGITIMATE OBSERVATION AT T1
+            # -----------------------------------------------
+
+            # T2 backscatters the incident ambient signal.
+            y1 = (
+                s * g1
+                + beta * s * g2 * b * G12
+                + noise1
+            )
+
+            # -----------------------------------------------
+            # LEGITIMATE OBSERVATION AT T2
+            # -----------------------------------------------
+
+            # T1 backscatters the incident ambient signal.
+            y2 = (
+                s * g2
+                + beta * s * g1 * b * G12
+                + noise2
+            )
+
+            # Extract reciprocal noncoherent observations.
+            u1 = extract_triangle_channel(y1)
+            u2 = extract_triangle_channel(y2)
+
+            # -----------------------------------------------
+            # IMPERFECT EAVESDROPPER CHANNEL ESTIMATES
+            # -----------------------------------------------
+
+            gd_hat = gd + egd
+            g1_hat = g1 + eg1
+            g2_hat = g2 + eg2
+
+            G1d_hat = G1d + eG1d
+            G2d_hat = G2d + eG2d
+
+            # -----------------------------------------------
+            # EAVESDROPPER MODEL 1
+            # -----------------------------------------------
+
+            # Magnitude of the three-channel product.
+            ud1 = np.abs(
+                gd_hat
+                * G2d_hat
+                * g2_hat
+            )
+
+            # -----------------------------------------------
+            # EAVESDROPPER MODEL 2
+            # -----------------------------------------------
+
+            # Magnitude of the four-channel product.
+            ud2 = np.abs(
+                G1d_hat
+                * g1_hat
+                * G2d_hat
+                * g2_hat
+            )
 
             return u1, u2, ud1, ud2
 
-        u1n, u2n, ud1n, ud2n = get_estimates(G12_noirs, G1d_noirs, G2d_noirs)
-        u1s, u2s, ud1s, ud2s = get_estimates(G12_sbf, G1d_sbf, G2d_sbf)
+        # ----------------------------------------------------
+        # WITHOUT IRS
+        # ----------------------------------------------------
 
-        U1_noirs.append(u1n); U2_noirs.append(u2n)
-        Ud1_noirs.append(ud1n); Ud2_noirs.append(ud2n)
-        U1_sbf.append(u1s); U2_sbf.append(u2s)
-        Ud1_sbf.append(ud1s); Ud2_sbf.append(ud2s)
+        # Only direct inter-tag and eavesdropper paths.
+        n = observations(
+            g12,
+            g1d,
+            g2d
+        )
 
-    U1_noirs, U2_noirs = np.asarray(U1_noirs), np.asarray(U2_noirs)
-    Ud1_noirs, Ud2_noirs = np.asarray(Ud1_noirs), np.asarray(Ud2_noirs)
-    U1_sbf, U2_sbf = np.asarray(U1_sbf), np.asarray(U2_sbf)
-    Ud1_sbf, Ud2_sbf = np.asarray(Ud1_sbf), np.asarray(Ud2_sbf)
+        # ----------------------------------------------------
+        # WITH IRS-SBF
+        # ----------------------------------------------------
 
-    # Unconditional MI (for verification that SKR <= MI)
-    mi_noirs = mi_knn(U1_noirs, U2_noirs)
-    mi_sbf = mi_knn(U1_sbf, U2_sbf)
+        # Use the SBF-optimized composite channel
+        # and IRS-assisted eavesdropper channels.
+        s_out = observations(
+            G12_sbf,
+            G1d_sbf,
+            G2d_sbf
+        )
 
-    # Conditional MI / SKR via the multivariate KSG estimator (same k-NN
-    # family as Figure 3, full sample set, no binning)
-    no_irs_model1 = cond_mi_ksg(U1_noirs, U2_noirs, Ud1_noirs)
-    no_irs_model2 = cond_mi_ksg(U1_noirs, U2_noirs, Ud2_noirs)
-    irs_model1 = cond_mi_ksg(U1_sbf, U2_sbf, Ud1_sbf)
-    irs_model2 = cond_mi_ksg(U1_sbf, U2_sbf, Ud2_sbf)
+        # ----------------------------------------------------
+        # STORE NO-IRS OBSERVATIONS
+        # ----------------------------------------------------
 
-    skr_noirs = min(no_irs_model1, no_irs_model2)
-    skr_sbf = min(irs_model1, irs_model2)
+        U1_noirs.append(n[0])
+        U2_noirs.append(n[1])
+
+        Ud1_noirs.append(n[2])
+        Ud2_noirs.append(n[3])
+
+        # ----------------------------------------------------
+        # STORE IRS-SBF OBSERVATIONS
+        # ----------------------------------------------------
+
+        U1_sbf.append(s_out[0])
+        U2_sbf.append(s_out[1])
+
+        Ud1_sbf.append(s_out[2])
+        Ud2_sbf.append(s_out[3])
+
+    # ========================================================
+    # 8. UNCONDITIONAL MUTUAL INFORMATION
+    # ========================================================
+
+    # Legitimate mutual information without IRS.
+    mi_noirs = mi_knn(
+        U1_noirs,
+        U2_noirs
+    )
+
+    # Legitimate mutual information with SBF-optimized IRS.
+    mi_sbf = mi_knn(
+        U1_sbf,
+        U2_sbf
+    )
+
+    # ========================================================
+    # 9. CONDITIONAL MUTUAL INFORMATION
+    # ========================================================
+
+    # --------------------------------------------------------
+    # EAVESDROPPER MODEL 1
+    # --------------------------------------------------------
+
+    # Conditional MI without IRS.
+    noirs_m1 = cond_mi_ksg(
+        U1_noirs,
+        U2_noirs,
+        Ud1_noirs
+    )
+
+    # Conditional MI with IRS-SBF.
+    sbf_m1 = cond_mi_ksg(
+        U1_sbf,
+        U2_sbf,
+        Ud1_sbf
+    )
+
+    # --------------------------------------------------------
+    # EAVESDROPPER MODEL 2
+    # --------------------------------------------------------
+
+    # Conditional MI without IRS.
+    noirs_m2 = cond_mi_ksg(
+        U1_noirs,
+        U2_noirs,
+        Ud2_noirs
+    )
+
+    # Conditional MI with IRS-SBF.
+    sbf_m2 = cond_mi_ksg(
+        U1_sbf,
+        U2_sbf,
+        Ud2_sbf
+    )
+
+    # ========================================================
+    # 10. WORST-CASE CONDITIONAL MI PROXY
+    # ========================================================
+
+    # Select the smaller conditional MI across the
+    # two eavesdropper observation models.
+    #
+    # This provides a conservative numerical proxy
+    # within the two considered observation models.
+    #
+    # It is not a proof of achievable secret-key rate.
+    skr_noirs = min(
+        noirs_m1,
+        noirs_m2
+    )
+
+    skr_sbf = min(
+        sbf_m1,
+        sbf_m2
+    )
 
     return (
-        max(0.0, no_irs_model1), max(0.0, no_irs_model2),
-        max(0.0, irs_model1), max(0.0, irs_model2),
-        mi_noirs, mi_sbf, skr_noirs, skr_sbf
+        noirs_m1,
+        noirs_m2,
+        sbf_m1,
+        sbf_m2,
+        mi_noirs,
+        mi_sbf,
+        skr_noirs,
+        skr_sbf
     )
 
 
-# ------------------------------------------------------------
-# Run full simulation
-# ------------------------------------------------------------
-results = {rho: {"noirs_m1": [], "noirs_m2": [], "sbf_m1": [], "sbf_m2": []} for rho in rho_values}
+# ============================================================
+# 11. RUN THE COMPLETE MONTE CARLO SIMULATION
+# ============================================================
 
-print("Verification that SKR <= MI at every point:\n")
+# Store the Figure 6 and Figure 7 results
+# separately for each spatial correlation value.
+results = {
+    rho: {
+        "noirs_m1": [],
+        "noirs_m2": [],
+        "sbf_m1": [],
+        "sbf_m2": []
+    }
+    for rho in rho_values
+}
+
+# Numerical records for CSV export.
+rows = []
+
+# Sweep both eavesdropper correlation settings.
 for rho in rho_values:
-    print(f"--- rho_corr = {rho} ---")
-    for snr_db in snr_db_range:
-        n1, n2, s1, s2, mi_noirs, mi_sbf, skr_noirs, skr_sbf = simulate_one_snr(snr_db, rho)
+
+    print(
+        f"\n--- rho_corr = {rho} ---",
+        flush=True
+    )
+
+    # Sweep SNR from 0 to 30 dB.
+    for snr in snr_db_range:
+
+        # Simulate legitimate and eavesdropper observations.
+        (
+            n1, n2, s1, s2,
+            mi_n, mi_s,
+            skr_n, skr_s
+        ) = simulate_one_snr(
+            snr,
+            rho
+        )
+
+        # ----------------------------------------------------
+        # STORE FIGURE 6: EAVESDROPPER MODEL 1
+        # ----------------------------------------------------
 
         results[rho]["noirs_m1"].append(n1)
-        results[rho]["noirs_m2"].append(n2)
         results[rho]["sbf_m1"].append(s1)
+
+        # ----------------------------------------------------
+        # STORE FIGURE 7: EAVESDROPPER MODEL 2
+        # ----------------------------------------------------
+
+        results[rho]["noirs_m2"].append(n2)
         results[rho]["sbf_m2"].append(s2)
 
-        ok_noirs = "OK" if skr_noirs <= mi_noirs + 1e-6 else "VIOLATION"
-        ok_sbf = "OK" if skr_sbf <= mi_sbf + 1e-6 else "VIOLATION"
+        # ----------------------------------------------------
+        # STORE NUMERICAL PERFORMANCE METRICS
+        # ----------------------------------------------------
 
-        print(f"SNR={snr_db:2d} dB | No-IRS: MI={mi_noirs:.3f}, SKR={skr_noirs:.3f} [{ok_noirs}] | "
-              f"SBF: MI={mi_sbf:.3f}, SKR={skr_sbf:.3f} [{ok_sbf}]")
-
-# ------------------------------------------------------------
-# Save results
-# ------------------------------------------------------------
-rows = []
-for rho in rho_values:
-    for i, snr in enumerate(snr_db_range):
         rows.append({
-            "rho_corr": rho, "SNR_dB": snr,
-            "NoIRS_Model1": results[rho]["noirs_m1"][i],
-            "IRS_SBF_Model1": results[rho]["sbf_m1"][i],
-            "NoIRS_Model2": results[rho]["noirs_m2"][i],
-            "IRS_SBF_Model2": results[rho]["sbf_m2"][i],
+            "rho": rho,
+            "SNR_dB": snr,
+            "MI_NoIRS": mi_n,
+            "MI_IRS_SBF": mi_s,
+            "SKR_NoIRS": skr_n,
+            "SKR_IRS_SBF": skr_s,
+            "SKR_Model1_NoIRS": n1,
+            "SKR_Model1_SBF": s1,
+            "SKR_Model2_NoIRS": n2,
+            "SKR_Model2_SBF": s2
         })
 
+        # Print progress and estimated MI/SKR proxy.
+        print(
+            f"SNR={snr:2d} dB | "
+            f"No-IRS: MI={mi_n:.3f}, "
+            f"SKR={skr_n:.3f} | "
+            f"SBF: MI={mi_s:.3f}, "
+            f"SKR={skr_s:.3f}",
+            flush=True
+        )
+
+
+# ============================================================
+# 12. SAVE NUMERICAL RESULTS
+# ============================================================
+
+# Convert simulation records to a DataFrame.
 df = pd.DataFrame(rows)
-csv_path = OUTPUT_DIR / "corrected_fig6_fig7_results_v2.csv"
-df.to_csv(csv_path, index=False)
+
+# Output CSV filename.
+csv_path = (
+    OUTPUT_DIR / "figures_6_7_results.csv"
+)
+
+# Save all estimated performance metrics.
+df.to_csv(
+    csv_path,
+    index=False
+)
+
 print("\nNumerical results:")
 print(df.round(4))
 
-# ------------------------------------------------------------
-# Paper-style plotting
-# ------------------------------------------------------------
-plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 13,
+print(
+    f"\nSaved CSV: {csv_path.resolve()}"
+)
+
+
+# ============================================================
+# 13. IEEE SINGLE-COLUMN PLOTTING STYLE
+# ============================================================
+
+# Configure publication-oriented plot formatting.
+mpl.rcParams.update({
+
+    # Bold text.
+    "font.weight": "bold",
+    "axes.labelweight": "bold",
+    "axes.titleweight": "bold",
+
+    # Axis and legend font sizes.
+    "axes.labelsize": 9,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8,
+
+    # Math and PDF font configuration.
+    "mathtext.default": "regular",
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+
+    # Axis border and tick formatting.
     "axes.linewidth": 1.1,
     "xtick.direction": "in",
-    "ytick.direction": "in"
+    "ytick.direction": "in",
+    "xtick.major.size": 4,
+    "ytick.major.size": 4
 })
 
 
-def plot_model(model_key, filename):
-    fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
+# ============================================================
+# 14. FIGURE PLOTTING FUNCTION
+# ============================================================
 
-    ax.plot(snr_db_range, results[0.0][f"noirs_{model_key}"], color="#e3342f",
-            marker="o", linestyle="-", linewidth=2, markersize=6,
-            label=r"Without IRS, $\rho_{\mathrm{corr}}=0$")
-    ax.plot(snr_db_range, results[0.0][f"sbf_{model_key}"], color="#2f9e44",
-            marker="s", linestyle="-", linewidth=2, markersize=6,
-            label=r"With IRS (SBF algorithm), $\rho_{\mathrm{corr}}=0$")
-    ax.plot(snr_db_range, results[0.9][f"noirs_{model_key}"], color="#e3342f",
-            marker="o", linestyle="--", linewidth=2, markersize=6,
-            label=r"Without IRS, $\rho_{\mathrm{corr}}=0.9$")
-    ax.plot(snr_db_range, results[0.9][f"sbf_{model_key}"], color="#2f9e44",
-            marker="s", linestyle="--", linewidth=2, markersize=6,
-            label=r"With IRS (SBF algorithm), $\rho_{\mathrm{corr}}=0.9$")
+def plot_model(model, filename):
+    """
+    Plot the conditional MI curves for one
+    eavesdropper observation model.
 
-    ax.set_xlabel("SNR (dB)")
-    ax.set_ylabel("Secret Key Rate (bits/channel use)")
-    ax.grid(True, linestyle=":", linewidth=0.7, alpha=0.6)
+    Each figure contains four curves:
+        - No IRS, rho=0
+        - IRS-SBF, rho=0
+        - No IRS, rho=0.9
+        - IRS-SBF, rho=0.9
+
+    Solid lines:
+        rho=0
+
+    Dashed lines:
+        rho=0.9
+
+    The figure is saved as a vector PDF.
+    """
+
+    # IEEE single-column figure dimensions.
+    fig, ax = plt.subplots(
+        figsize=(3.5, 2.5),
+        dpi=300
+    )
+
+    # --------------------------------------------------------
+    # CURVE DEFINITIONS
+    # --------------------------------------------------------
+
+    # Tuple format:
+    # (correlation, scheme, color, marker, line style)
+    curves = [
+        (0.0, "noirs", "#e3342f", "o", "-"),
+        (0.0, "sbf", "#2f9e44", "s", "-"),
+        (0.9, "noirs", "#e3342f", "o", "--"),
+        (0.9, "sbf", "#2f9e44", "s", "--")
+    ]
+
+    # --------------------------------------------------------
+    # PLOT CONDITIONAL MI CURVES
+    # --------------------------------------------------------
+
+    for (
+        rho,
+        scheme,
+        color,
+        marker,
+        linestyle
+    ) in curves:
+
+        # Scheme label.
+        if scheme == "noirs":
+            label = "Without IRS"
+        else:
+            label = "With IRS (SBF algorithm)"
+
+        # Append eavesdropper correlation coefficient.
+        label += (
+            rf", $\rho_{{\mathrm{{corr}}}}={rho:g}$"
+        )
+
+        # Plot the simulated conditional MI values.
+        ax.plot(
+            snr_db_range,
+            results[rho][f"{scheme}_{model}"],
+            color=color,
+            marker=marker,
+            linestyle=linestyle,
+            linewidth=1.8,
+            markersize=5,
+            label=label
+        )
+
+    # --------------------------------------------------------
+    # AXIS LABELS
+    # --------------------------------------------------------
+
+    ax.set_xlabel(
+        "SNR (dB)",
+        fontweight="bold"
+    )
+
+    # Retained from the supplied figure implementation.
+    #
+    # The plotted values are conditional MI estimates.
+    # Calling them achievable SKR requires additional
+    # protocol and information-theoretic justification.
+    ax.set_ylabel(
+        "Secret Key Rate (bits/channel use)",
+        fontweight="bold"
+    )
+
+    # --------------------------------------------------------
+    # GRID AND AXIS FORMATTING
+    # --------------------------------------------------------
+
+    ax.grid(
+        True,
+        linestyle="--",
+        linewidth=0.6,
+        alpha=0.5
+    )
+
     ax.set_axisbelow(True)
-    ax.legend(fontsize=9.5, handlelength=4.0)
-    for spine in ax.spines.values():
-        spine.set_color('0.3')
-    plt.tight_layout()
 
-    output_path = OUTPUT_DIR / filename
-    plt.savefig(output_path, dpi=600, bbox_inches="tight")
-    print(f"Saved: {output_path.resolve()}")
+    # Axis border color.
+    for spine in ax.spines.values():
+        spine.set_color("0.3")
+
+    # Bold tick labels.
+    for tick in (
+        ax.get_xticklabels()
+        + ax.get_yticklabels()
+    ):
+        tick.set_fontweight("bold")
+
+    # --------------------------------------------------------
+    # LEGEND FORMATTING
+    # --------------------------------------------------------
+
+    legend = ax.legend(
+        loc="upper left",
+        fontsize=8.5,
+        frameon=True,
+        fancybox=False,
+        edgecolor="black",
+        framealpha=1.0,
+        handlelength=2.2,
+        handletextpad=0.4,
+        borderpad=0.4
+    )
+
+    legend.get_frame().set_linewidth(1.2)
+
+    for text in legend.get_texts():
+        text.set_fontweight("bold")
+
+    # Optimize figure spacing.
+    fig.tight_layout(pad=0.4)
+
+    # --------------------------------------------------------
+    # SAVE VECTOR PDF
+    # --------------------------------------------------------
+
+    path = OUTPUT_DIR / filename
+
+    plt.savefig(
+        path,
+        format="pdf",
+        bbox_inches="tight",
+        facecolor="white"
+    )
+
+    print(f"Saved: {path.resolve()}")
+
     plt.show()
 
 
-plot_model("m1", "figure6_skr_model1_fixed.png")
-plot_model("m2", "figure7_skr_model2_fixed.png")
+# ============================================================
+# 15. GENERATE FIGURE 6
+# ============================================================
+
+# Figure 6 evaluates the conditional MI under
+# eavesdropper observation model 1:
+#
+# Ud1 = |gd_hat * G2d_hat * g2_hat|
+#
+# The figure compares No-IRS and IRS-SBF
+# configurations for rho=0 and rho=0.9.
+
+plot_model(
+    "m1",
+    "figure6_skr_model1.pdf"
+)
+
+
+# ============================================================
+# 16. GENERATE FIGURE 7
+# ============================================================
+
+# Figure 7 evaluates the conditional MI under
+# eavesdropper observation model 2:
+#
+# Ud2 = |G1d_hat * g1_hat * G2d_hat * g2_hat|
+#
+# The same IRS-SBF algorithm and channel model
+# are used for a consistent comparison.
+
+plot_model(
+    "m2",
+    "figure7_skr_model2.pdf"
+)
