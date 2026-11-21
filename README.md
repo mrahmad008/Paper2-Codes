@@ -3,7 +3,7 @@ This repository contains the Python-based simulation code used to generate the r
 
 ## Overview
 
-The considered system model includes an ambient RF source, two backscatter tags ($T_1$ and $T_2$), and an intelligent reflecting surface (IRS).
+The considered system model includes an ambient RF source, two backscatter tags ($T_1$ and $T_2$), an intelligent reflecting surface (IRS), and an eavesdropper (Darth).
 
 Three configurations are evaluated for physical-layer secret key generation:
 
@@ -11,7 +11,7 @@ Three configurations are evaluated for physical-layer secret key generation:
 - **Single-Bit Feedback (SBF):** The IRS phase shifts are iteratively perturbed, and one feedback bit indicates whether the estimated triangle-channel gain has improved.
 - **Perfect CSI:** The IRS phase shifts are optimized using perfect channel state information as an ideal benchmark.
 
-The repository also includes simulations for mutual information (MI), bit disagreement rate (BDR), SBF convergence, and parameter sensitivity using cyclic prefix-based triangle-channel extraction.
+The repository also includes simulations for mutual information (MI), bit disagreement rate (BDR), secret key rate (SKR) under eavesdropper models, and parameter sensitivity using cyclic prefix-based triangle-channel extraction.
 
 ## Simulation Setup
 
