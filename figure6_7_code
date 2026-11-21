@@ -1288,7 +1288,7 @@ mpl.rcParams.update({
     "axes.labelsize": 9,
     "xtick.labelsize": 8,
     "ytick.labelsize": 8,
-    "legend.fontsize": 8,
+    "legend.fontsize": 6.2,
 
     # Math and PDF font configuration.
     "mathtext.default": "regular",
@@ -1430,8 +1430,8 @@ def plot_model(model, filename):
     # --------------------------------------------------------
 
     legend = ax.legend(
-        loc="upper left",
-        fontsize=8.5,
+        loc="lower right",
+        fontsize=6.2,
         frameon=True,
         fancybox=False,
         edgecolor="black",
