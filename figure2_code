@@ -1,152 +1,833 @@
+
 import os
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from sklearn.feature_selection import mutual_info_regression
 
+# ============================================================
+# FIGURE 2: TRIANGLE-CHANNEL SCATTER COMPARISON
+#
+# Compares the observations obtained at legitimate tags
+# T1 and T2 under two configurations:
+#
+#   1. Without IRS
+#   2. With IRS optimized using one-bit stochastic
+#      beamforming (SBF)
+#
+# The channel model, path-loss assumptions, noise reference,
+# and SBF parameters are aligned with Figures 6 and 7.
+# ============================================================
+
+# Fixed random seed for reproducible Monte Carlo results.
 np.random.seed(42)
 
 # ------------------------------------------------------------
-#  Parameters (matching the paper's stated simulation setup,
-#  consistent with the Figure 3/4 script)
+# SIMULATION PARAMETERS
 # ------------------------------------------------------------
-p = 1.0
-beta = 0.3 + 0.4j
-num_samples = 1000          # matches Figures 3-6 sample count
-SNR_dB = 20
-sigma_n = np.sqrt(10.0 ** (-SNR_dB / 10.0))
 
+# Ambient RF source transmit power.
+p = 1.0
+
+# Complex reflection coefficient of the backscatter tag.
+beta = 0.3 + 0.4j
+
+# Number of independent channel realizations.
+num_samples = 5000
+
+# Operating SNR in dB.
+SNR_dB = 20
+
+# OFDM parameters:
+# N     : number of OFDM subcarriers
+# Ncp   : cyclic-prefix length
+# L_max : maximum assumed channel impulse-response length
+# Nt    : total OFDM symbol length including the CP
 N = 256
 Ncp = 64
 L_max = 10
 Nt = N + Ncp
 
+# IRS and SBF parameters:
+# M              : number of IRS reflecting elements
+# SBF_iterations : number of one-bit feedback iterations
+# delta          : maximum phase perturbation magnitude
 M = 128
 SBF_iterations = 30
-delta = np.pi / 20   # perturbation range, eps_m(k) ~ U[-delta, delta]
+delta = np.pi / 20
 
+# Directory for saving the generated figure.
 OUTPUT_DIR = "./outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ------------------------------------------------------------
-#  Helper functions
+# PROPAGATION AND CHANNEL GEOMETRY
 # ------------------------------------------------------------
+
+# Distance-dependent path-loss exponent.
+ETA = 3.0
+
+# Distances of the source-to-tag and inter-tag links.
+D_S1, D_S2, D_12 = 8.0, 7.0, 3.0
+
+# Number of channel taps for the corresponding links.
+TAU_S1, TAU_S2, TAU_12 = 8, 7, 3
+
+# Distances of the cascaded IRS-assisted links.
+# Environment variables permit changing these distances
+# without modifying the source code.
+D_1I = float(os.getenv("D_1I", "3.0"))
+D_I2 = float(os.getenv("D_I2", "3.0"))
+
+
+# ============================================================
+# CHANNEL GENERATION
+# ============================================================
+
 def generate_channel_taps(L):
-    """Exponential PDP Rayleigh fading taps with 3 dB decay per tap."""
+    """
+    Generate L independent complex Rayleigh fading taps.
+
+    An exponentially decaying power-delay profile (PDP)
+    with 3 dB decay per tap is used.
+
+    The PDP is normalized so that the sum of the average
+    powers across all taps equals one.
+    """
+
     decay_per_tap_dB = 3.0
     r = 10 ** (-decay_per_tap_dB / 10.0)
+
+    # Exponentially decaying tap powers.
     power = r ** np.arange(L)
+
+    # Normalize the total channel power.
     power = power / np.sum(power)
-    taps = np.sqrt(power / 2) * (np.random.randn(L) + 1j * np.random.randn(L))
+
+    # Generate circularly symmetric complex Gaussian taps.
+    taps = np.sqrt(power / 2) * (
+        np.random.randn(L)
+        + 1j * np.random.randn(L)
+    )
+
     return taps
 
+
+def link_amp(distance):
+    """
+    Calculate the distance-dependent channel amplitude.
+
+    The amplitude scales as d^(-ETA/2), corresponding
+    to a received-power scaling of d^(-ETA).
+    """
+
+    if distance <= 0:
+        raise ValueError("Distance must be positive")
+
+    return distance ** (-ETA / 2.0)
+
+
+def dominant_tap_channel(L, distance):
+    """
+    Generate the dominant (first) channel tap and apply
+    the distance-dependent path-loss amplitude.
+
+    The complete PDP is generated, but the first tap
+    is used in the effective scalar channel model.
+    """
+
+    return generate_channel_taps(L)[0] * link_amp(distance)
+
+
+def dominant_tap_variance(L, distance):
+    """
+    Compute the theoretical variance of the dominant tap
+    after incorporating distance-dependent path loss.
+
+    This variance is used to define the reference
+    backscatter power for noise normalization.
+    """
+
+    r = 10 ** (-3.0 / 10.0)
+
+    return (
+        link_amp(distance)**2
+        / np.sum(r ** np.arange(L))
+    )
+
+
+# ------------------------------------------------------------
+# NOISE POWER NORMALIZATION
+# ------------------------------------------------------------
+
+# The noise reference is the average no-IRS backscatter
+# power associated with the dominant channel taps.
+#
+# This ensures that the SNR definition remains consistent
+# when comparing the no-IRS and IRS-assisted configurations.
+
+baseline_power = (
+    p * abs(beta)**2
+    * dominant_tap_variance(TAU_S2, D_S2)
+    * dominant_tap_variance(TAU_12, D_12)
+)
+
+# Convert the specified SNR into the standard deviation
+# of circularly symmetric complex Gaussian noise.
+sigma_n = np.sqrt(
+    baseline_power * 10.0 ** (-SNR_dB / 10.0)
+)
+
+
+# ============================================================
+# OFDM SIGNAL GENERATION
+# ============================================================
+
 def ofdm_symbol(N, Ncp):
-    data = (np.random.choice([1+1j, 1-1j, -1+1j, -1-1j], N) / np.sqrt(2))
+    """
+    Generate a QPSK-modulated OFDM symbol with a cyclic prefix.
+
+    The last Ncp samples of the time-domain OFDM symbol
+    are copied to the beginning to form the cyclic prefix.
+    """
+
+    # Generate random QPSK symbols in the frequency domain.
+    data = np.random.choice(
+        [1+1j, 1-1j, -1+1j, -1-1j],
+        N
+    ) / np.sqrt(2)
+
+    # Transform the frequency-domain symbols into the
+    # time domain using an energy-normalized IFFT.
     ifft_out = np.fft.ifft(data, N) * np.sqrt(N)
+
+    # Construct the cyclic prefix.
     cp = ifft_out[-Ncp:]
+
     return np.concatenate([cp, ifft_out])
 
+
 def backscatter_waveform(Nt, bit=1):
+    """
+    Generate the backscatter modulation waveform.
+
+    For bit=1, the reflection waveform changes sign
+    halfway through the OFDM symbol.
+
+    This sign-changing waveform is used by the
+    CP-based triangle-channel extraction procedure.
+    """
+
     if bit == 0:
         return -np.ones(Nt, dtype=complex)
-    else:
-        w = np.ones(Nt, dtype=complex)
-        half = Nt // 2
-        w[half:] = -1
-        return w
+
+    w = np.ones(Nt, dtype=complex)
+
+    half = Nt // 2
+
+    # Apply the sign reversal to the second half.
+    w[half:] = -1
+
+    return w
+
+
+# ============================================================
+# TRIANGLE-CHANNEL EXTRACTION
+# ============================================================
 
 def extract_triangle_channel(y, N, Ncp, L_max):
+    """
+    Extract a noncoherent triangle-channel observation
+    using the cyclic-prefix redundancy of the OFDM signal.
+
+    Two samples separated by N positions are combined
+    through subtraction and addition.
+
+    The resulting products are averaged in magnitude
+    over the selected CP observation interval.
+
+    No explicit channel-state information (CSI)
+    is required by this extraction procedure.
+    """
+
+    # Exclude the initial CP samples according to
+    # the maximum assumed channel delay.
     start = L_max - 1
     end = Ncp - 1
+
+    # Fallback if the specified observation interval
+    # is invalid.
     if start >= end:
         start = 0
         end = Ncp
+
+    # Number of samples used for averaging.
     J = end - start + 1
+
     if J <= 0:
         return 0.0
+
     sum_abs = 0.0
+
     for n in range(start, end + 1):
+
+        # Difference of the two CP-related observations.
         z_b = y[n] - y[n + N]
+
+        # Sum of the two CP-related observations.
         z_d = y[n] + y[n + N]
+
+        # Accumulate the magnitude of their product.
         sum_abs += np.abs(z_b * z_d)
+
+    # Return the averaged noncoherent observation.
     return sum_abs / J
 
-# ------------------------------------------------------------
-#  SBF algorithm (Algorithm 1), matching Eq. (37) exactly
-# ------------------------------------------------------------
-def sbf_algorithm(h1_I, g_I2, iterations, delta):
-    M = len(h1_I)
-    phi_best = np.random.uniform(0, 2 * np.pi, M)
-    u_best = np.abs(np.sum(h1_I * np.exp(1j * phi_best) * g_I2))
+
+# ============================================================
+# COMPOSITE IRS CHANNEL
+# ============================================================
+
+def composite_channel(g12_direct, g1_I, g_I2, phi):
+    """
+    Construct the effective inter-tag channel.
+
+    G12 = g12_direct + sum_m(
+        g1_I[m] * exp(j*phi[m]) * g_I2[m]
+    )
+
+    The first term represents the direct inter-tag path.
+    The summation represents the IRS-reflected path.
+
+    No 1/sqrt(M) normalization is applied, matching
+    the channel model used in Figures 6 and 7.
+    """
+
+    irs_component = np.sum(
+        g1_I * np.exp(1j * phi) * g_I2
+    )
+
+    return g12_direct + irs_component
+
+
+# ============================================================
+# RECEIVED SIGNAL FOR SBF FEEDBACK
+# ============================================================
+
+def generate_feedback_observation(
+    G12,
+    g1,
+    g2,
+    pilot,
+    b,
+    sigma_n
+):
+    """
+    Generate a noisy triangle-channel observation at T1.
+
+    This observation serves as the measurement-based
+    objective of the SBF algorithm.
+
+    A new noise realization is generated for each
+    feedback measurement, so the IRS optimization
+    does not rely on perfect CSI.
+    """
+
+    # Direct ambient signal received at T1.
+    direct_T1 = pilot * g1
+
+    # Backscattered signal from T2 received at T1
+    # through the effective inter-tag channel.
+    back_T1 = (
+        beta * (pilot * g2) * b * G12
+    )
+
+    # Independent complex AWGN for this measurement.
+    noise1 = sigma_n * (
+        np.random.randn(Nt)
+        + 1j * np.random.randn(Nt)
+    ) / np.sqrt(2)
+
+    # Total received signal at T1.
+    y1 = direct_T1 + back_T1 + noise1
+
+    # Obtain the noncoherent triangle-channel metric.
+    return extract_triangle_channel(
+        y1, N, Ncp, L_max
+    )
+
+
+# ============================================================
+# MEASUREMENT-BASED ONE-BIT SBF ALGORITHM
+# ============================================================
+
+def sbf_algorithm(
+    g12_direct,
+    g1_I,
+    g_I2,
+    g1,
+    g2,
+    sigma_n,
+    iterations,
+    delta
+):
+    """
+    Perform one-bit stochastic beamforming (SBF).
+
+    The IRS phases are optimized through random
+    perturbations and noisy channel measurements.
+
+    At each iteration:
+      1. Perturb the currently accepted IRS phases.
+      2. Measure the new triangle-channel observation.
+      3. Generate one binary accept/reject decision.
+      4. Update the IRS phases only if the new
+         observation exceeds the stored best value.
+
+    The algorithm uses measurement-based feedback
+    rather than explicit instantaneous CSI.
+
+    The feedback bit is modeled as an ideal logical
+    decision. Physical feedback transmission and
+    possible feedback errors are not simulated here.
+
+    Returns:
+      G_best          : selected composite channel
+      phi_best        : selected IRS phase vector
+      accepted_updates: number of accepted perturbations
+    """
+
+    num_elements = len(g1_I)
+
+    # Use a fixed OFDM pilot during one SBF optimization.
+    pilot = ofdm_symbol(N, Ncp)
+
+    # Generate the backscatter modulation waveform.
+    b = backscatter_waveform(Nt, bit=1)
+
+    # Initialize the IRS with uniformly random phases.
+    phi_best = np.random.uniform(
+        0.0,
+        2.0 * np.pi,
+        num_elements
+    )
+
+    # Calculate the initial composite channel.
+    G_best = composite_channel(
+        g12_direct,
+        g1_I,
+        g_I2,
+        phi_best
+    )
+
+    # Measure the initial noisy triangle-channel metric.
+    u_best = generate_feedback_observation(
+        G_best,
+        g1,
+        g2,
+        pilot,
+        b,
+        sigma_n
+    )
+
+    accepted_updates = 0
+
+    # Perform the specified number of SBF iterations.
     for k in range(iterations):
-        eps = np.random.uniform(-delta, delta, M)
-        phi_new = phi_best + eps
-        u_new = np.abs(np.sum(h1_I * np.exp(1j * phi_new) * g_I2))
-        if u_new > u_best:
+
+        # Generate independent phase perturbations
+        # uniformly distributed over [-delta, delta].
+        perturbation = np.random.uniform(
+            -delta,
+            delta,
+            num_elements
+        )
+
+        # Construct the candidate IRS configuration.
+        phi_new = phi_best + perturbation
+
+        # Calculate its corresponding composite channel.
+        G_new = composite_channel(
+            g12_direct,
+            g1_I,
+            g_I2,
+            phi_new
+        )
+
+        # Evaluate the candidate using a new noisy
+        # CP-based triangle-channel observation.
+        u_new = generate_feedback_observation(
+            G_new,
+            g1,
+            g2,
+            pilot,
+            b,
+            sigma_n
+        )
+
+        # One-bit SBF decision:
+        # 1 = accept the candidate configuration.
+        # 0 = retain the previously selected configuration.
+        feedback_bit = int(u_new > u_best)
+
+        # Update the IRS phases only if the
+        # candidate observation is better.
+        if feedback_bit == 1:
+
             u_best = u_new
             phi_best = phi_new
-    return u_best
+            G_best = G_new
 
-def run_simulation(use_irs, num_samples):
-    v1_list, v2_list = [], []
-    L_h = max(1, L_max // 2)
-    for _ in range(num_samples):
-        h1_dir = generate_channel_taps(L_h)
-        h2_dir = generate_channel_taps(L_h)
-        h12_dir = generate_channel_taps(L_h)
-        g1 = h1_dir[0]
-        g2 = h2_dir[0]
-        direct_inward = h12_dir[0]
+            accepted_updates += 1
 
-        if use_irs:
-            h1_I = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
-            g_I2 = (np.random.randn(M) + 1j * np.random.randn(M)) / np.sqrt(2)
-            sbf_gain = sbf_algorithm(h1_I, g_I2, SBF_iterations, delta)
-            G12 = direct_inward + sbf_gain
-        else:
-            G12 = direct_inward
+    # Note:
+    # For 30 iterations, 30 sequential binary decisions
+    # are generated. Their transmission using passive
+    # backscatter is an architectural assumption,
+    # not a physical-layer process simulated here.
 
+    return G_best, phi_best, accepted_updates
+
+
+# ============================================================
+# LEGITIMATE TRIANGLE-CHANNEL OBSERVATIONS
+# ============================================================
+
+def get_triangle_estimate(
+    G12,
+    g1,
+    g2,
+    s_t,
+    b,
+    noise1,
+    noise2
+):
+    """
+    Generate the legitimate observations u1 and u2.
+
+    Two reciprocal backscatter communication directions
+    are considered:
+
+      T2 backscatters and T1 receives.
+      T1 backscatters and T2 receives.
+
+    Both observations depend on the common inter-tag
+    channel G12 but contain different source-to-tag
+    channels and receiver noise realizations.
+    """
+
+    # --------------------------------------------------------
+    # OBSERVATION AT T1
+    # --------------------------------------------------------
+
+    # T2 backscatters the ambient RF signal toward T1.
+    back_T1 = beta * (s_t * g2) * b * G12
+
+    # Direct ambient signal at T1.
+    direct_T1 = s_t * g1
+
+    # Received signal at T1.
+    y1 = back_T1 + direct_T1 + noise1
+
+    # Noncoherent observation extracted at T1.
+    u1 = extract_triangle_channel(
+        y1, N, Ncp, L_max
+    )
+
+    # --------------------------------------------------------
+    # OBSERVATION AT T2
+    # --------------------------------------------------------
+
+    # T1 backscatters the ambient RF signal toward T2.
+    back_T2 = beta * (s_t * g1) * b * G12
+
+    # Direct ambient signal at T2.
+    direct_T2 = s_t * g2
+
+    # Received signal at T2.
+    y2 = back_T2 + direct_T2 + noise2
+
+    # Noncoherent observation extracted at T2.
+    u2 = extract_triangle_channel(
+        y2, N, Ncp, L_max
+    )
+
+    return u1, u2
+
+
+# ============================================================
+# MUTUAL INFORMATION ESTIMATION
+# ============================================================
+
+def mutual_info_continuous(x, y):
+    """
+    Estimate the mutual information between two
+    continuous-valued triangle-channel observations.
+
+    The sklearn k-nearest-neighbor estimator is used
+    with three neighbors.
+
+    sklearn reports mutual information in nats.
+    Division by ln(2) converts the result into bits.
+
+    The nonnegative result is an empirical estimate,
+    not an analytical closed-form mutual information.
+    """
+
+    x = np.asarray(x).reshape(-1, 1)
+    y = np.asarray(y)
+
+    mi_nats = mutual_info_regression(
+        x,
+        y,
+        n_neighbors=3,
+        random_state=42
+    )[0]
+
+    return max(0.0, mi_nats / np.log(2))
+
+
+# ============================================================
+# MONTE CARLO SIMULATION
+# ============================================================
+
+def run_simulation(num_samples):
+    """
+    Perform independent Monte Carlo channel realizations.
+
+    For every realization:
+      1. Generate direct and IRS-assisted channels.
+      2. Optimize the IRS phases using noisy SBF.
+      3. Generate a common OFDM signal.
+      4. Generate receiver noise.
+      5. Extract reciprocal observations with and
+         without IRS.
+
+    The same OFDM symbol and receiver noise are used
+    in both configurations within each realization
+    to support a paired comparison.
+    """
+
+    # Store observations without IRS.
+    v1_no, v2_no = [], []
+
+    # Store observations with IRS-SBF.
+    v1_irs, v2_irs = [], []
+
+    # Record accepted SBF updates for each realization.
+    accepted_updates_list = []
+
+    for sample_idx in range(num_samples):
+
+        # ----------------------------------------------------
+        # DIRECT CHANNEL GENERATION
+        # ----------------------------------------------------
+
+        # Source-to-T1 channel.
+        g1 = dominant_tap_channel(TAU_S1, D_S1)
+
+        # Source-to-T2 channel.
+        g2 = dominant_tap_channel(TAU_S2, D_S2)
+
+        # Direct inter-tag channel.
+        g12_direct = dominant_tap_channel(TAU_12, D_12)
+
+        # ----------------------------------------------------
+        # IRS-ASSISTED CHANNEL GENERATION
+        # ----------------------------------------------------
+
+        # T1-to-IRS fading coefficients.
+        g1_I = link_amp(D_1I) * (
+            np.random.randn(M)
+            + 1j * np.random.randn(M)
+        ) / np.sqrt(2)
+
+        # IRS-to-T2 fading coefficients.
+        g_I2 = link_amp(D_I2) * (
+            np.random.randn(M)
+            + 1j * np.random.randn(M)
+        ) / np.sqrt(2)
+
+        # No 1/sqrt(M) normalization is applied
+        # to the cascaded IRS contribution.
+
+        # ----------------------------------------------------
+        # NO-IRS CONFIGURATION
+        # ----------------------------------------------------
+
+        # Only the direct inter-tag channel is present.
+        G12_noirs = g12_direct
+
+        # ----------------------------------------------------
+        # IRS-SBF CONFIGURATION
+        # ----------------------------------------------------
+
+        # Optimize the IRS phases through noisy
+        # one-bit measurement-based feedback.
+        G12_sbf, theta_star, accepted = sbf_algorithm(
+            g12_direct,
+            g1_I,
+            g_I2,
+            g1,
+            g2,
+            sigma_n,
+            SBF_iterations,
+            delta
+        )
+
+        accepted_updates_list.append(accepted)
+
+        # ----------------------------------------------------
+        # COMMON SIGNAL AND RECEIVER NOISE
+        # ----------------------------------------------------
+
+        # Generate the OFDM signal used for the
+        # final reciprocal observations.
         s_t = ofdm_symbol(N, Ncp)
 
+        # Backscatter modulation waveform.
         b = backscatter_waveform(Nt, bit=1)
-        backscatter_T1 = beta * (s_t * g2) * b * G12
-        direct_T1 = s_t * g1
-        noise1 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
-        y1 = backscatter_T1 + direct_T1 + noise1
 
-        b = backscatter_waveform(Nt, bit=1)
-        backscatter_T2 = beta * (s_t * g1) * b * G12
-        direct_T2 = s_t * g2
-        noise2 = sigma_n * (np.random.randn(Nt) + 1j * np.random.randn(Nt)) / np.sqrt(2)
-        y2 = backscatter_T2 + direct_T2 + noise2
+        # Complex AWGN at T1.
+        noise1 = sigma_n * (
+            np.random.randn(Nt)
+            + 1j * np.random.randn(Nt)
+        ) / np.sqrt(2)
 
-        v1 = extract_triangle_channel(y1, N, Ncp, L_max)
-        v2 = extract_triangle_channel(y2, N, Ncp, L_max)
-        v1_list.append(v1)
-        v2_list.append(v2)
+        # Complex AWGN at T2.
+        noise2 = sigma_n * (
+            np.random.randn(Nt)
+            + 1j * np.random.randn(Nt)
+        ) / np.sqrt(2)
 
-    return np.array(v1_list), np.array(v2_list)
+        # ----------------------------------------------------
+        # TRIANGLE-CHANNEL OBSERVATIONS WITHOUT IRS
+        # ----------------------------------------------------
 
-# ------------------------------------------------------------
-#  Run both scenarios
-# ------------------------------------------------------------
-v1_irs, v2_irs = run_simulation(True, num_samples)
-v1_no, v2_no = run_simulation(False, num_samples)
+        u1_no, u2_no = get_triangle_estimate(
+            G12_noirs,
+            g1,
+            g2,
+            s_t,
+            b,
+            noise1,
+            noise2
+        )
 
-corr_irs, _ = pearsonr(v1_irs, v2_irs)
-mi_irs = mutual_info_regression(v1_irs.reshape(-1, 1), v2_irs, random_state=42)[0]
+        # ----------------------------------------------------
+        # TRIANGLE-CHANNEL OBSERVATIONS WITH IRS-SBF
+        # ----------------------------------------------------
+
+        u1_irs, u2_irs = get_triangle_estimate(
+            G12_sbf,
+            g1,
+            g2,
+            s_t,
+            b,
+            noise1,
+            noise2
+        )
+
+        # Store the no-IRS observations.
+        v1_no.append(u1_no)
+        v2_no.append(u2_no)
+
+        # Store the IRS-assisted observations.
+        v1_irs.append(u1_irs)
+        v2_irs.append(u2_irs)
+
+        # Display progress every 500 realizations.
+        if (sample_idx + 1) % 500 == 0:
+            print(
+                f"Completed {sample_idx + 1}/{num_samples}"
+            )
+
+    # Convert observation lists into NumPy arrays.
+    return (
+        np.asarray(v1_no),
+        np.asarray(v2_no),
+        np.asarray(v1_irs),
+        np.asarray(v2_irs),
+        np.asarray(accepted_updates_list)
+    )
+
+
+# ============================================================
+# RUN MONTE CARLO SIMULATION
+# ============================================================
+
+(
+    v1_no,
+    v2_no,
+    v1_irs,
+    v2_irs,
+    accepted_updates
+) = run_simulation(num_samples)
+
+
+# ============================================================
+# NUMERICAL RESULTS
+# ============================================================
+
+# Pearson correlation quantifies the linear dependence
+# between the legitimate observations u1 and u2.
 corr_no, _ = pearsonr(v1_no, v2_no)
-mi_no = mutual_info_regression(v1_no.reshape(-1, 1), v2_no, random_state=42)[0]
+corr_irs, _ = pearsonr(v1_irs, v2_irs)
 
-print(f"Without IRS: corr={corr_no:.4f}, MI={mi_no:.4f} bits")
-print(f"With IRS (SBF algorithm): corr={corr_irs:.4f}, MI={mi_irs:.4f} bits")
+# Mutual information estimates statistical dependence
+# beyond linear correlation.
+mi_no = mutual_info_continuous(v1_no, v2_no)
+mi_irs = mutual_info_continuous(v1_irs, v2_irs)
 
-# ------------------------------------------------------------
-#  High-quality scatter plot (single combined window)
-# ------------------------------------------------------------
-plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 13,
+print("\n" + "=" * 60)
+print("FIGURE 2 — UPDATED NUMERICAL RESULTS")
+print("=" * 60)
+
+print(f"SNR: {SNR_dB} dB")
+print(f"Samples: {num_samples}")
+print(f"IRS elements: {M}")
+print(f"SBF iterations: {SBF_iterations}")
+print(f"Baseline backscatter power: {baseline_power:.6e}")
+print(f"Noise standard deviation: {sigma_n:.6e}")
+
+print(
+    f"\nWithout IRS: "
+    f"corr={corr_no:.4f}, "
+    f"MI={mi_no:.4f} bits"
+)
+
+print(
+    f"With IRS-SBF: "
+    f"corr={corr_irs:.4f}, "
+    f"MI={mi_irs:.4f} bits"
+)
+
+print(
+    f"Average accepted updates: "
+    f"{np.mean(accepted_updates):.2f}"
+)
+
+print("=" * 60)
+
+
+# ============================================================
+# SCATTER PLOT — IEEE SINGLE-COLUMN STYLE
+# ============================================================
+
+# Configure figure typography and axis appearance
+# for a compact IEEE-style publication figure.
+mpl.rcParams.update({
+    "font.weight": "bold",
+    "axes.labelweight": "bold",
+    "axes.titleweight": "bold",
+    "axes.labelsize": 9,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8,
+    "mathtext.default": "regular",
+    "pdf.fonttype": 42,     # Embed TrueType fonts in PDF
+    "ps.fonttype": 42,
     "axes.linewidth": 1.1,
     "xtick.direction": "in",
     "ytick.direction": "in",
@@ -154,36 +835,153 @@ plt.rcParams.update({
     "ytick.major.size": 4,
 })
 
-fig, ax = plt.subplots(1, 1, figsize=(6.2, 5.4), dpi=300)
+# Create a single-column-sized figure.
+fig, ax = plt.subplots(
+    1, 1,
+    figsize=(3.5, 2.5),
+    dpi=300
+)
+
+# ------------------------------------------------------------
+# NORMALIZE THE OBSERVATIONS FOR VISUAL COMPARISON
+# ------------------------------------------------------------
+
+# Each observation axis is normalized by its own
+# maximum value within the corresponding configuration.
+#
+# This normalization is used only for the scatter plot.
+# Correlation and MI were calculated from the original
+# unnormalized observations above.
 
 v1_no_n = v1_no / v1_no.max()
 v2_no_n = v2_no / v2_no.max()
+
 v1_irs_n = v1_irs / v1_irs.max()
 v2_irs_n = v2_irs / v2_irs.max()
 
-ax.scatter(v1_no_n, v2_no_n, s=8, alpha=0.45, edgecolors='none',
-           color='#e3342f', label='Without IRS', rasterized=True)
-ax.scatter(v1_irs_n, v2_irs_n, s=8, alpha=0.45, edgecolors='none',
-           color='#2f9e44', label='With IRS (SBF algorithm)', rasterized=True)
-ax.plot([0, 1], [0, 1], color='k', linestyle='--', linewidth=1.0,
-        alpha=0.6, label=r'$u_1=u_2$')
+# ------------------------------------------------------------
+# SCATTER: WITHOUT IRS
+# ------------------------------------------------------------
 
-ax.set_xlabel(r'$u_1$')
-ax.set_ylabel(r'$u_2$')
-ax.grid(True, linestyle=':', linewidth=0.7, alpha=0.6)
+ax.scatter(
+    v1_no_n,
+    v2_no_n,
+    s=8,
+    alpha=0.45,
+    edgecolors="none",
+    color="#e3342f",
+    label="Without IRS",
+    rasterized=True
+)
+
+# ------------------------------------------------------------
+# SCATTER: WITH IRS-SBF
+# ------------------------------------------------------------
+
+ax.scatter(
+    v1_irs_n,
+    v2_irs_n,
+    s=8,
+    alpha=0.45,
+    edgecolors="none",
+    color="#2f9e44",
+    label="With IRS (SBF algorithm)",
+    rasterized=True
+)
+
+# ------------------------------------------------------------
+# REFERENCE LINE
+# ------------------------------------------------------------
+
+# The diagonal u1 = u2 represents ideal agreement
+# between the two normalized legitimate observations.
+ax.plot(
+    [0, 1],
+    [0, 1],
+    color="k",
+    linestyle="--",
+    linewidth=1.0,
+    alpha=0.6,
+    label=r"$u_1=u_2$"
+)
+
+# ------------------------------------------------------------
+# AXIS LABELS AND GRID
+# ------------------------------------------------------------
+
+ax.set_xlabel(r"$u_1$", fontweight="bold")
+ax.set_ylabel(r"$u_2$", fontweight="bold")
+
+ax.grid(
+    True,
+    linestyle="--",
+    linewidth=0.6,
+    alpha=0.5
+)
+
 ax.set_axisbelow(True)
-for spine in ax.spines.values():
-    spine.set_color('0.3')
 
-legend = ax.legend(loc='upper left', frameon=True, fontsize=10, markerscale=3)
+# Adjust axis spine appearance.
+for spine in ax.spines.values():
+    spine.set_color("0.3")
+
+# Apply bold formatting to tick labels.
+for tick in ax.get_xticklabels() + ax.get_yticklabels():
+    tick.set_fontweight("bold")
+
+# ------------------------------------------------------------
+# LEGEND FORMATTING
+# ------------------------------------------------------------
+
+legend = ax.legend(
+    loc="upper left",
+    fontsize=7.8,
+    frameon=True,
+    fancybox=False,
+    edgecolor="black",
+    framealpha=1.0,
+    handlelength=2.2,
+    handletextpad=0.4,
+    borderpad=0.4,
+    markerscale=3
+)
+
+legend.get_frame().set_linewidth(1.2)
+
+for text in legend.get_texts():
+    text.set_fontweight("bold")
+
 for lh in legend.legend_handles:
     lh.set_alpha(1.0)
 
-plt.tight_layout()
-out_path = os.path.abspath(os.path.join(OUTPUT_DIR, 'figure2_comparison_scatter.png'))
+# Optimize spacing for publication.
+fig.tight_layout(pad=0.4)
+
+
+# ============================================================
+# SAVE FIGURE
+# ============================================================
+
+# Save the final scatter plot as a high-resolution PDF.
+out_path = os.path.abspath(
+    os.path.join(
+        OUTPUT_DIR,
+        "figure2_comparison_scatter.pdf"
+    )
+)
+
 try:
-    plt.savefig(out_path, dpi=600, bbox_inches='tight')
-    print(f"Saved: {out_path}")
+    plt.savefig(
+        out_path,
+        format="pdf",
+        dpi=600,
+        bbox_inches="tight"
+    )
+
+    print(f"\nSaved: {out_path}")
+
 except Exception as e:
     print(f"FAILED to save figure: {e}")
+
+# Display the generated figure.
 plt.show()
